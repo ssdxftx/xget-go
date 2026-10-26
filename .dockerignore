@@ -1,0 +1,6 @@
+# Keep the Docker build context minimal: only runtime assets are needed.
+*
+!xget-linux-amd64
+!xget-linux-arm64
+!Dockerfile
+!LICENSE

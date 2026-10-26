@@ -1,0 +1,4 @@
+xget-linux-amd64
+xget-linux-arm64
+xget-darwin-arm64
+*.log

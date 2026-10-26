@@ -1,0 +1,32 @@
+[Unit]
+Description=Xget-Go — single-binary acceleration engine (port of xixu-me/Xget)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust paths to your installation layout.
+ExecStart=/usr/local/bin/xget-go
+WorkingDirectory=/var/lib/xget
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# ---- Configuration (environment variables) ----
+Environment=PORT=8080
+# Set a token! Leaving it empty exposes an open proxy instance.
+#Environment=ACCESS_TOKEN=change-me-to-a-long-random-string
+Environment=TIMEOUT_SECONDS=30
+Environment=MAX_RETRIES=3
+Environment=RETRY_DELAY_MS=1000
+Environment=MAX_PATH_LENGTH=2048
+Environment=CACHE_TTL=1800
+
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
