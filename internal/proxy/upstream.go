@@ -128,7 +128,7 @@ func captureBody(r *http.Request) (*bodyProvider, error) {
 }
 
 // buildHeaders constructs upstream request headers for one attempt.
-func buildHeaders(in *http.Request, passthrough bool, targetURL string) http.Header {
+func buildHeaders(in *http.Request, passthrough bool, targetURL string, traits Traits, plat string) http.Header {
         h := http.Header{}
 
         if passthrough {
@@ -140,6 +140,16 @@ func buildHeaders(in *http.Request, passthrough bool, targetURL string) http.Hea
                                 h.Add(k, v)
                         }
                 }
+                // AI / HF protocol defaults (port of configureAIHeaders and
+                // configureHuggingFaceHeaders).
+                if traits.AI || traits.HF {
+                        if in.Method == http.MethodPost && h.Get("Content-Type") == "" {
+                                h.Set("Content-Type", "application/json")
+                        }
+                        if traits.AI && h.Get("User-Agent") == "" {
+                                h.Set("User-Agent", "Xget-AI-Proxy/1.0")
+                        }
+                }
                 return h
         }
 
@@ -148,6 +158,11 @@ func buildHeaders(in *http.Request, passthrough bool, targetURL string) http.Hea
         enc := "gzip, deflate, br"
         rangeHeader := in.Header.Get("Range")
         if rangeHeader != "" || mediaFilePattern.MatchString(targetURL) {
+                enc = "identity"
+        }
+        if mayRewritePlatform(plat) {
+                // Rewritable metadata must arrive plain-text: the stdlib has no
+                // brotli decoder and rewrites run on the raw body.
                 enc = "identity"
         }
         h.Set("Accept-Encoding", enc)
@@ -164,9 +179,11 @@ func buildHeaders(in *http.Request, passthrough bool, targetURL string) http.Hea
 }
 
 // fetchUpstream executes the upstream request with the retry pipeline.
-func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, traits Traits, passthrough bool) *upstreamResult {
+// key/effectivePath come pre-resolved from the caller (docker paths are
+// normalized before routing, so resolving them here from the raw path
+// would yield no platform).
+func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, traits Traits, passthrough bool, key, effectivePath string) *upstreamResult {
         start := time.Now()
-        key, _ := platform.Resolve(v.Path)
 
         body, err := captureBody(in)
         if err != nil {
@@ -183,11 +200,13 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
                 maxAttempts = 1 // cannot replay a huge streamed body
         }
 
-        baseHeaders := buildHeaders(in, passthrough, targetURL)
+        baseHeaders := buildHeaders(in, passthrough, targetURL, traits, key)
         var resp *http.Response
+        var actualAttempts int
         timerFired := false
 
         for attempt := 0; attempt < maxAttempts; attempt++ {
+                actualAttempts = attempt + 1
                 bodyRc, _ := body.get()
                 req, err := http.NewRequestWithContext(in.Context(), in.Method, targetURL, bodyRc)
                 if err != nil {
@@ -196,7 +215,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
                 if bodyRc != nil && body != nil && body.buf != nil {
                         req.ContentLength = int64(len(body.buf))
                 }
-                req.Header = buildHeaders(in, passthrough, targetURL).Clone()
+                req.Header = buildHeaders(in, passthrough, targetURL, traits, key).Clone()
 
                 // Timeout bounds time-to-headers only; once headers arrive the
                 // timer is stopped so multi-GB downloads stream without cutoff.
@@ -244,7 +263,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
                 }
 
                 if traits.Docker && r.StatusCode == http.StatusUnauthorized {
-                        resp = h.dockerAnonymousRetry(in.Context(), targetURL, key, v.Path, baseHeaders, body, r)
+                        resp = h.dockerAnonymousRetry(in.Context(), targetURL, key, effectivePath, baseHeaders, body, r, in)
                         break
                 }
 
@@ -268,7 +287,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 
         return &upstreamResult{
                 resp:     resp,
-                attempts: maxAttempts,
+                attempts: actualAttempts,
                 fetchMs:  float64(time.Since(start).Microseconds()) / 1000.0,
         }
 }
@@ -331,36 +350,42 @@ func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header,
 
 // dockerAnonymousRetry answers a registry 401 challenge by fetching an
 // anonymous pull token and retrying once (port of retryDockerWithAnonymousToken).
-// On failure the original 401 challenge is returned untouched so the client
-// sees a standards-compliant response.
+// On failure a synthesized 401 is returned whose realm points at this
+// instance's /cr/<reg>/v2/auth, so docker clients run their credential
+// flow through the login proxy (port of responseUnauthorized).
 func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effectivePath string,
-        headers http.Header, body *bodyProvider, challenge *http.Response) *http.Response {
+        headers http.Header, body *bodyProvider, challenge *http.Response, r *http.Request) *http.Response {
+
+        deny := func() *http.Response {
+                challenge.Body.Close()
+                return responseUnauthorized(r, key)
+        }
 
         authStr := challenge.Header.Get("WWW-Authenticate")
         if authStr == "" {
-                return challenge
+                return deny()
         }
         ch, err := platform.ParseAuthenticate(authStr)
         if err != nil {
-                return challenge
+                return deny()
         }
         scope := platform.ScopeFromPath(key, effectivePath)
 
         treq, err := http.NewRequestWithContext(ctx, http.MethodGet, ch.TokenURL(scope), nil)
         if err != nil {
-                return challenge
+                return deny()
         }
         tres, err := h.client.Do(treq)
         if err != nil {
-                return challenge
+                return deny()
         }
         defer tres.Body.Close()
         if tres.StatusCode != http.StatusOK {
-                return challenge
+                return deny()
         }
         token := readRegistryToken(tres.Body)
         if token == "" {
-                return challenge
+                return deny()
         }
 
         hdr := headers.Clone()
@@ -368,7 +393,7 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
         bodyRc, _ := body.get()
         req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, bodyRc)
         if err != nil {
-                return challenge
+                return deny()
         }
         if bodyRc != nil && body != nil && body.buf != nil {
                 req.ContentLength = int64(len(body.buf))
@@ -377,15 +402,16 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 
         retryResp, err := h.dockerClient.Do(req)
         if err != nil {
-                return challenge
+                return deny()
         }
         retryResp = h.followDockerRedirect(retryResp, hdr, body)
         if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
                 challenge.Body.Close()
                 return retryResp
         }
+        _, _ = io.Copy(io.Discard, io.LimitReader(retryResp.Body, 64<<10))
         retryResp.Body.Close()
-        return challenge
+        return deny()
 }
 
 // readRegistryToken extracts token/access_token from a registry token

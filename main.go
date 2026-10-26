@@ -44,8 +44,9 @@ func main() {
         cfg := config.FromEnv()
 
         log.SetFlags(log.LstdFlags | log.LUTC)
-        log.Printf("xget-go %s starting — port=%s auth=%s retries=%d timeout=%ds platforms=%d",
-                version, cfg.Port, authLabel(cfg), cfg.MaxRetries, cfg.TimeoutSecond, len(platform.Catalog))
+        log.Printf("xget-go %s starting — port=%s auth=%s retries=%d timeout=%ds platforms=%d cache=%s",
+                version, cfg.Port, authLabel(cfg), cfg.MaxRetries, cfg.TimeoutSecond,
+                len(platform.Catalog), cacheLabel(cfg))
         if cfg.AccessToken == "" {
                 log.Printf("WARNING: ACCESS_TOKEN is empty — the instance is open to anyone who can reach it. " +
                         "The official Xget README strongly recommends putting instances behind authentication or IP allowlists.")
@@ -91,6 +92,13 @@ func authLabel(cfg *config.Config) string {
         return "token"
 }
 
+func cacheLabel(cfg *config.Config) string {
+        if cfg.CacheDir == "" || strings.EqualFold(cfg.CacheDir, "off") || strings.EqualFold(cfg.CacheDir, "none") {
+                return "disabled"
+        }
+        return fmt.Sprintf("%s (max %dMB/file %dMB)", cfg.CacheDir, cfg.CacheMaxMB, cfg.CacheMaxFileMB)
+}
+
 func printUsage() {
         fmt.Printf(`xget-go %s — single-binary port of xixu-me/Xget (AGPL-3.0-or-later)
 
@@ -105,7 +113,10 @@ Environment variables:
   MAX_RETRIES       upstream retry attempts              (default 3)
   RETRY_DELAY_MS    linear backoff base                  (default 1000)
   MAX_PATH_LENGTH   URL path length cap                  (default 2048)
-  CACHE_TTL         Cache-Control max-age hint, seconds  (default 1800)
+  CACHE_TTL         mutable cache TTL, seconds           (default 300)
+  CACHE_DIR         disk cache dir; off/none disables    (default cache)
+  CACHE_MAX_MB      total cache budget, LRU eviction     (default 1024)
+  CACHE_MAX_FILE_MB per-entry cache cap                  (default 512)
   ALLOWED_METHODS   methods for non-protocol requests    (default GET,HEAD)
   ALLOWED_ORIGINS   CORS origins, comma-separated        (default *)
   HOMEPAGE_URL      redirect target for /                (default upstream repo)

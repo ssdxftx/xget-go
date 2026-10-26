@@ -10,6 +10,7 @@
 package proxy
 
 import (
+        "bytes"
         "crypto/subtle"
         "encoding/json"
         "fmt"
@@ -21,6 +22,7 @@ import (
         "strings"
         "time"
 
+        "xget/internal/cache"
         "xget/internal/config"
         "xget/internal/platform"
         "xget/internal/security"
@@ -29,8 +31,9 @@ import (
 // Handler serves the accelerated proxy.
 type Handler struct {
         cfg          *config.Config
-        client       *http.Client        // follows redirects (default fetch semantics)
-        dockerClient *http.Client        // does NOT follow redirects (manual auth-safe follow)
+        client       *http.Client   // follows redirects (default fetch semantics)
+        dockerClient *http.Client   // does NOT follow redirects (manual auth-safe follow)
+        store        *cache.Store   // disk cache replacing the edge cache
 }
 
 // New wires up clients with a shared tuned transport.
@@ -47,6 +50,7 @@ func New(cfg *config.Config) *Handler {
                 cfg:          cfg,
                 client:       &http.Client{Transport: tr},
                 dockerClient: &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+                store:        cache.Open(cfg.CacheDir, cfg.CacheMaxMB, cfg.CacheMaxFileMB),
         }
 }
 
@@ -202,11 +206,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
                 }
                 effectivePath = normalized
 
-                // The /v2/auth login-proxy endpoint belongs to the full edition.
+                // The /v2/auth login proxy negotiates registry credentials
+                // for private repositories (full docker login chain).
                 if path == "/v2/auth" || regexpMustMatch(`/^\/cr\/[^/]+\/v2\/auth\/?$/`)(path) {
-                        security.WriteError(w, r,
-                                "Docker login proxy (/v2/auth) requires the full edition of Xget; this standard binary supports anonymous pulls of public images",
-                                http.StatusNotImplemented, false)
+                        h.handleDockerAuth(w, r, path)
+                        log.Printf("%s %s%s → docker-auth", clientIP(r), r.Method, r.URL.RequestURI())
                         return
                 }
         }
@@ -242,22 +246,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
                 r.Header.Del("Authorization")
         }
 
-        // Protocol requests (git/LFS/docker) and non-GET/HEAD pass headers raw.
+        // Protocol requests (git/LFS/docker/AI/HF) and non-GET/HEAD pass headers raw.
         passthrough := traits.IsProtocol() || (r.Method != http.MethodGet && r.Method != http.MethodHead)
 
-        up := h.fetchUpstream(r, v, targetURL, traits, passthrough)
-        h.finalize(w, r, up, traits, passthrough, key, start)
+        // Cache policy and lookup (port of tryReadCachedResponse: protocol
+        // requests, sensitive headers and non-GET/HEAD never touch the cache).
+        sensitive := r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != ""
+        canUseCache := r.Method == http.MethodGet || r.Method == http.MethodHead
+        policy := resolveCachePolicy(canUseCache, sensitive, traits, key, effectivePath, targetURL, h.cfg.CacheTTL)
+        if policy.Cacheable {
+                if entry := h.store.Get(cache.Key(targetURL)); entry != nil {
+                        h.serveFromCache(w, r, entry, key, start)
+                        log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
+                                clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
+                        return
+                }
+        }
+        cacheStatus := string(policy.Mode) // edge→edge / bypass / private
 
-        log.Printf("%s %s%s → %s [%s] status=%d attempts=%d fetch_ms=%.1f total_ms=%.1f",
+        up := h.fetchUpstream(r, v, targetURL, traits, passthrough, key, effectivePath)
+        h.finalize(w, r, up, traits, passthrough, key, effectivePath, targetURL, policy, cacheStatus, start)
+
+        log.Printf("%s %s%s → %s [%s] status=%d attempts=%d fetch_ms=%.1f total_ms=%.1f cache=%s",
                 clientIP(r), r.Method, r.URL.RequestURI(), targetURL, keyOrDash(key),
                 up.resp.StatusCode, up.attempts, up.fetchMs,
-                float64(time.Since(start).Microseconds())/1000.0)
+                float64(time.Since(start).Microseconds())/1000.0, cacheStatus)
 }
 
 // finalize writes the upstream (or locally generated) response to the client,
-// port of finalizeResponse: error wrapping for standard requests, hop-by-hop
-// stripping, cache hints, security + CORS + performance headers, streaming.
-func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamResult, traits Traits, passthrough bool, key string, start time.Time) {
+// port of finalizeResponse: error wrapping (with the private-repository hint
+// for bare docker 401s), text rewriting (pypi/npm/flathub), hop-by-hop
+// stripping, cache-policy Cache-Control headers, disk-cache tee, security +
+// CORS + performance headers and streaming.
+func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamResult, traits Traits, passthrough bool, key, effectivePath, targetURL string, policy CachePolicy, cacheStatus string, start time.Time) {
         resp := up.resp
         defer func() {
                 if resp.Body != nil {
@@ -266,14 +287,26 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
                 }
         }()
 
-        // Standard requests wrap upstream failures into the JSON error contract.
-        if !traits.IsProtocol() && !up.local && resp.StatusCode >= 400 {
-                body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-                resp.Body.Close() // fully consumed up to the cap; drop the rest
-                resp = security.BuildErrorResponse(
-                        fmt.Sprintf("Upstream server error (%d): %s", resp.StatusCode, string(body)),
-                        resp.StatusCode, true)
-                up.local = true
+        // Error wrapping: standard requests get the JSON contract; docker 401s
+        // without a challenge hint at private repositories. Git/LFS/AI/HF
+        // errors pass through untouched.
+        if !up.local && resp.StatusCode >= 400 {
+                switch {
+                case !traits.IsProtocol():
+                        body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+                        resp.Body.Close() // fully consumed up to the cap; drop the rest
+                        resp = security.BuildErrorResponse(
+                                fmt.Sprintf("Upstream server error (%d): %s", resp.StatusCode, string(body)),
+                                resp.StatusCode, true)
+                        up.local = true
+                case traits.Docker && resp.StatusCode == http.StatusUnauthorized && resp.Header.Get("WWW-Authenticate") == "":
+                        body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+                        resp.Body.Close()
+                        resp = security.BuildErrorResponse(
+                                fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
+                                resp.StatusCode, true)
+                        up.local = true
+                }
         }
 
         hdr := w.Header()
@@ -313,25 +346,44 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
                                 target += "?" + q
                         }
                         hdr.Del("Content-Length")
-                        if cl := h.probeHEADContentLength(r.Context(), target, buildHeaders(r, passthrough, target)); cl != "" {
+                        if cl := h.probeHEADContentLength(r.Context(), target, buildHeaders(r, passthrough, target, traits, key2)); cl != "" {
                                 hdr.Set("Content-Length", cl)
                         }
                 }
         }
 
-        // Standard requests receive cache hints and hardening headers.
+        // Text rewriting keeps follow-up requests flowing through this
+        // instance (port of the finalizeSuccessfulResponse rewriters).
+        var bodySrc io.Reader = resp.Body
+        if !traits.IsProtocol() && r.Method == http.MethodGet && resp.StatusCode == http.StatusOK &&
+                shouldRewriteTextResponse(key, effectivePath, resp.Header.Get("Content-Type")) {
+                raw, _ := io.ReadAll(io.LimitReader(resp.Body, rewriteMaxBytes+1))
+                if len(raw) <= rewriteMaxBytes {
+                        rewritten := rewriteTextResponse(key, effectivePath, string(raw), requestOrigin(r))
+                        bodySrc = strings.NewReader(rewritten)
+                        hdr.Set("Content-Length", strconv.Itoa(len(rewritten)))
+                        hdr.Del("Content-Encoding") // identity was requested upstream
+                } else {
+                        bodySrc = io.MultiReader(bytes.NewReader(raw), resp.Body)
+                }
+        }
+
+        // Cache-policy headers + disk-cache write (port of the response-aware
+        // resolveCachePolicy + background cache.put).
+        var cacheWriter *cache.Writer
         if !traits.IsProtocol() {
                 if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
-                        sensitive := r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != ""
-                        if sensitive {
-                                hdr.Set("Cache-Control", "private, max-age="+strconv.Itoa(h.cfg.CacheTTL))
+                        respPolicy := resolveResponseCachePolicy(policy, resp.Header)
+                        hdr.Set("Cache-Control", respPolicy.CacheControlValue())
+                        if respPolicy.PrivateOnly {
                                 if vary := hdr.Get("Vary"); vary != "" {
                                         hdr.Set("Vary", vary+", Authorization, Cookie")
                                 } else {
                                         hdr.Set("Vary", "Authorization, Cookie")
                                 }
-                        } else {
-                                hdr.Set("Cache-Control", "public, max-age="+strconv.Itoa(h.cfg.CacheTTL))
+                        }
+                        if resp.StatusCode == http.StatusOK && r.Method == http.MethodGet && respPolicy.Cacheable {
+                                cacheWriter = h.store.Begin(cache.Key(targetURL), resp.StatusCode, hdr, respPolicy.EdgeTTL)
                         }
                 }
                 hdr.Set("X-Content-Type-Options", "nosniff")
@@ -341,22 +393,39 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 
         allowed := h.methodAllowed(traits)
         security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, allowed)
-
-        if !traits.IsProtocol() {
-                metrics := map[string]any{
-                        "total_ms":   round100(float64(time.Since(start).Microseconds()) / 1000.0),
-                        "upstream_ms": round100(up.fetchMs),
-                        "attempts":   up.attempts,
-                        "platform":   key,
-                }
-                if j, err := json.Marshal(metrics); err == nil {
-                        hdr.Set("X-Performance-Metrics", string(j))
-                }
-        }
+        h.emitMetrics(w, r, traits, key, start, up.fetchMs, up.attempts, cacheStatus)
 
         w.WriteHeader(resp.StatusCode)
-        if r.Method != http.MethodHead && resp.Body != nil {
-                _, _ = io.Copy(w, resp.Body)
+        var copyErr error
+        if r.Method != http.MethodHead && bodySrc != nil {
+                dst := io.Writer(w)
+                if cacheWriter != nil {
+                        dst = io.MultiWriter(w, cacheWriter)
+                }
+                _, copyErr = io.Copy(dst, bodySrc)
+        }
+        if copyErr != nil {
+                cacheWriter.Abort() // client vanished: don't keep a partial file
+        } else {
+                cacheWriter.Commit()
+        }
+}
+
+// emitMetrics sets the X-Performance-Metrics header (must run before the
+// response status is written).
+func (h *Handler) emitMetrics(w http.ResponseWriter, r *http.Request, traits Traits, key string, start time.Time, fetchMs float64, attempts int, cacheStatus string) {
+        if traits.IsProtocol() {
+                return
+        }
+        metrics := map[string]any{
+                "total_ms":    round100(float64(time.Since(start).Microseconds()) / 1000.0),
+                "upstream_ms": round100(fetchMs),
+                "attempts":    attempts,
+                "platform":    key,
+                "cache":       cacheStatus,
+        }
+        if j, err := json.Marshal(metrics); err == nil {
+                w.Header().Set("X-Performance-Metrics", string(j))
         }
 }
 

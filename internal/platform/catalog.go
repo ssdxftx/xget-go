@@ -11,10 +11,10 @@ import (
 
 // Catalog maps a platform key to its upstream base URL.
 //
-// Core high-frequency subset of the original 100+ entry catalog, covering
-// code hosting, AI model hubs, package registries and container registries.
-// Unknown keys are unknown — the handler redirects to the homepage, exactly
-// like the original.
+// Full mirror of the original PLATFORM_CATALOG: code hosting, AI model
+// hubs, package registries, Linux distributions, AI inference providers
+// and container registries. Unknown keys are unknown — the handler
+// redirects to the homepage, exactly like the original.
 var Catalog = map[string]string{
 	// Code Repositories & Version Control
 	"gh":       "https://github.com",
@@ -22,30 +22,95 @@ var Catalog = map[string]string{
 	"gl":       "https://gitlab.com",
 	"gitea":    "https://gitea.com",
 	"codeberg": "https://codeberg.org",
-
-	// AI / Model Hubs
-	"hf":      "https://huggingface.co",
-	"civitai": "https://civitai.com",
+	"sf":       "https://sourceforge.net",
+	"aosp":     "https://android.googlesource.com",
+	"hf":       "https://huggingface.co",
+	"civitai":  "https://civitai.com",
 
 	// Package Managers
-	"npm":             "https://registry.npmjs.org",
-	"pypi":            "https://pypi.org",
-	"pypi-files":      "https://files.pythonhosted.org",
-	"conda":           "https://repo.anaconda.com",
-	"conda-community": "https://conda.anaconda.org",
-	"maven":           "https://repo1.maven.org",
-	"golang":          "https://proxy.golang.org",
-	"crates":          "https://crates.io",
-	"nuget":           "https://api.nuget.org",
-	"rubygems":        "https://rubygems.org",
+	"npm":              "https://registry.npmjs.org",
+	"pypi":             "https://pypi.org",
+	"pypi-files":       "https://files.pythonhosted.org",
+	"conda":            "https://repo.anaconda.com",
+	"conda-community":  "https://conda.anaconda.org",
+	"maven":            "https://repo1.maven.org",
+	"apache":           "https://downloads.apache.org",
+	"gradle":           "https://plugins.gradle.org",
+	"homebrew":         "https://github.com/Homebrew",
+	"homebrew-api":     "https://formulae.brew.sh/api",
+	"homebrew-bottles": "https://ghcr.io",
+	"rubygems":         "https://rubygems.org",
+	"cran":             "https://cran.r-project.org",
+	"cpan":             "https://www.cpan.org",
+	"ctan":             "https://tug.ctan.org",
+	"golang":           "https://proxy.golang.org",
+	"nuget":            "https://api.nuget.org",
+	"crates":           "https://crates.io",
+	"packagist":        "https://repo.packagist.org",
+	"flathub":          "https://dl.flathub.org",
+
+	// Linux Distributions
+	"debian":  "https://deb.debian.org",
+	"ubuntu":  "https://archive.ubuntu.com",
+	"fedora":  "https://mirrors.kernel.org/fedora",
+	"rocky":   "https://download.rockylinux.org",
+	"opensuse": "https://download.opensuse.org",
+	"arch":    "https://geo.mirror.pkgbuild.com",
+
+	// Other Resources
+	"arxiv":   "https://arxiv.org",
+	"fdroid":  "https://f-droid.org",
+	"jenkins": "https://updates.jenkins.io",
+
+	// AI Inference Providers
+	"ip-openai":        "https://api.openai.com",
+	"ip-anthropic":     "https://api.anthropic.com",
+	"ip-gemini":        "https://generativelanguage.googleapis.com",
+	"ip-vertexai":      "https://aiplatform.googleapis.com",
+	"ip-cohere":        "https://api.cohere.ai",
+	"ip-mistralai":     "https://api.mistral.ai",
+	"ip-xai":           "https://api.x.ai",
+	"ip-githubmodels":  "https://models.github.ai",
+	"ip-nvidiaapi":     "https://integrate.api.nvidia.com",
+	"ip-perplexity":    "https://api.perplexity.ai",
+	"ip-braintrust":    "https://api.braintrust.dev",
+	"ip-groq":          "https://api.groq.com",
+	"ip-cerebras":      "https://api.cerebras.ai",
+	"ip-sambanova":     "https://api.sambanova.ai",
+	"ip-siray":         "https://api.siray.ai",
+	"ip-huggingface":   "https://router.huggingface.co",
+	"ip-together":      "https://api.together.xyz",
+	"ip-replicate":     "https://api.replicate.com",
+	"ip-fireworks":     "https://api.fireworks.ai",
+	"ip-nebius":        "https://api.studio.nebius.ai",
+	"ip-jina":          "https://api.jina.ai",
+	"ip-voyageai":      "https://api.voyageai.com",
+	"ip-falai":         "https://fal.run",
+	"ip-novita":        "https://api.novita.ai",
+	"ip-burncloud":     "https://ai.burncloud.com",
+	"ip-openrouter":    "https://openrouter.ai",
+	"ip-poe":           "https://api.poe.com",
+	"ip-featherlessai": "https://api.featherless.ai",
+	"ip-hyperbolic":    "https://api.hyperbolic.xyz",
 
 	// Container Registries
-	"cr-docker": "https://registry-1.docker.io",
-	"cr-ghcr":   "https://ghcr.io",
-	"cr-quay":   "https://quay.io",
-	"cr-gcr":    "https://gcr.io",
-	"cr-mcr":    "https://mcr.microsoft.com",
-	"cr-k8s":    "https://registry.k8s.io",
+	"cr-docker":       "https://registry-1.docker.io",
+	"cr-quay":         "https://quay.io",
+	"cr-gcr":          "https://gcr.io",
+	"cr-mcr":          "https://mcr.microsoft.com",
+	"cr-ecr":          "https://public.ecr.aws",
+	"cr-ghcr":         "https://ghcr.io",
+	"cr-gitlab":       "https://registry.gitlab.com",
+	"cr-redhat":       "https://registry.redhat.io",
+	"cr-oracle":       "https://container-registry.oracle.com",
+	"cr-cloudsmith":   "https://docker.cloudsmith.io",
+	"cr-digitalocean": "https://registry.digitalocean.com",
+	"cr-vmware":       "https://projects.registry.vmware.com",
+	"cr-k8s":          "https://registry.k8s.io",
+	"cr-heroku":       "https://registry.heroku.com",
+	"cr-suse":         "https://registry.suse.com",
+	"cr-opensuse":     "https://registry.opensuse.org",
+	"cr-gitpod":       "https://registry.gitpod.io",
 }
 
 // Entry is a flattened, pre-computed routing rule.
@@ -114,11 +179,9 @@ func PlatformPath(key string) string {
 
 // TransformPath converts a routed request path into the upstream path:
 // strips the platform prefix and applies platform-specific rewrites.
-// Port of transformPath + PLATFORM_PATH_TRANSFORMERS (core subset).
+// Port of transformPath + PLATFORM_PATH_TRANSFORMERS (complete set).
 func TransformPath(effectivePath, key string) string {
-	base, ok := Catalog[key]
-	_ = base
-	if !ok {
+	if _, ok := Catalog[key]; !ok {
 		return effectivePath
 	}
 
@@ -130,8 +193,11 @@ func TransformPath(effectivePath, key string) string {
 		stripped = "/"
 	}
 
-	if key == "crates" {
+	switch key {
+	case "crates":
 		return transformCratesPath(stripped)
+	case "fedora":
+		return transformFedoraPath(stripped)
 	}
 	return stripped
 }
@@ -145,5 +211,21 @@ func transformCratesPath(p string) string {
 	return "/api/v1/crates" + p
 }
 
+// transformFedoraPath strips the redundant /pub/fedora/linux prefix, port
+// of transformFedoraPath: the upstream base already ends in /fedora.
+func transformFedoraPath(p string) string {
+	const marker = "/pub/fedora/linux"
+	if p == marker {
+		return "/"
+	}
+	if strings.HasPrefix(p, marker+"/") {
+		return strings.TrimPrefix(p, marker)
+	}
+	return p
+}
+
 // IsContainer reports whether the platform is a container registry.
 func IsContainer(key string) bool { return strings.HasPrefix(key, "cr-") }
+
+// IsAIProvider reports whether the platform is an AI inference provider.
+func IsAIProvider(key string) bool { return strings.HasPrefix(key, "ip-") }

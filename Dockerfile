@@ -3,6 +3,7 @@
 # Build:  docker build -t xget-go .
 # Run:    docker run -d -p 127.0.0.1:8080:8080 \
 #           -e ACCESS_TOKEN=$(openssl rand -hex 32) \
+#           -v xget-cache:/var/cache/xget \
 #           --restart unless-stopped --name xget xget-go
 #
 # Stage 1 compiles the static binary inside golang:1.23-alpine (zero
@@ -23,13 +24,19 @@ RUN CGO_ENABLED=0 go build -trimpath \
 FROM alpine:3.20
 # CA certificates are mandatory: every upstream connection is HTTPS.
 RUN apk add --no-cache ca-certificates wget \
-    && adduser -D -H -u 1000 xget
+    && adduser -D -H -u 1000 xget \
+    && mkdir -p /var/cache/xget \
+    && chown -R xget:root /var/cache/xget
 COPY --from=build /out/xget-go /usr/local/bin/xget-go
 RUN chmod 0755 /usr/local/bin/xget-go
 
 ENV PORT=8080
+ENV CACHE_DIR=/var/cache/xget
+ENV CACHE_MAX_MB=1024
+ENV CACHE_MAX_FILE_MB=512
 USER xget
 EXPOSE 8080
+VOLUME ["/var/cache/xget"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- "http://127.0.0.1:${PORT}/healthz" | grep -q ok || exit 1

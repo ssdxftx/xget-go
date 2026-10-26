@@ -37,39 +37,45 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 | 能力 | 说明 |
 |------|------|
-| 平台前缀路由 | 23 个高频平台，最长前缀优先匹配（`/pypi/files/` 优先于 `/pypi/`） |
-| Range 断点续传 | 原样透传 `Range` 请求头与 `206 Partial Content` 响应 |
+| 平台前缀路由 | 84 个平台（与官方目录全量一致），最长前缀优先匹配（`/pypi/files/` 优先于 `/pypi/`） |
+| Range 断点续传 | 原样透传 `Range` 请求头与 `206 Partial Content` 响应；命中缓存时直接切片 |
 | 失败重试 | 最多 `MAX_RETRIES` 次，线性退避（`RETRY_DELAY_MS × 第 N 次`） |
 | 响应头超时 | 单次尝试 `TIMEOUT_SECONDS` 秒内未收到响应头则重试；**大文件流式传输不限时** |
 | HEAD 探测回填 | 上游 `HEAD` 响应缺 `Content-Length` 时自动改用 `Range` 探测回填，保证 `wget`/下载工具显示进度 |
 | Git Smart HTTP | `git clone / pull / push` 与 `/info/refs`、`git-upload-pack`、`git-receive-pack` 原样透传 |
 | Git LFS | `/info/lfs`、`objects/batch`、SHA-256 对象路径识别与透传 |
-| Docker Registry v2 | 六大容器仓库加速，支持 `daemon.json` 镜像源配置，匿名 token 自动重试 |
+| Docker Registry v2 | 17 家容器仓库加速，支持 `daemon.json` 镜像源配置，匿名 token 自动重试 |
+| Docker 私有仓库登录链 | `/v2/auth` 完整实现：`docker login` 走本实例完成凭证交换，支持私有镜像 |
+| AI 推理代理 | 28 家 `ip-*` 前缀（OpenAI/Anthropic/Gemini/Groq…），POST/流式响应原样透传 |
+| Hugging Face API | `/hf/api`、`/hf/token` 协议级透传，`Authorization` 保留 |
+| 内容改写 | PyPI 索引页、npm 元数据、Flatpak 描述文件中的上游链接自动改写回本实例 |
+| 磁盘缓存层 | 对齐官方三级 TTL 策略（immutable 86400s / metadata 60s / mutable 300s），LRU 驱逐、可配容量 |
 | 实例鉴权 | `X-Xget-Token` 头 / `Authorization: Bearer` / `?xget_token=` 三通道，常量时间比较 |
 | 请求校验 | 路径穿越拦截（`..`）、控制字符过滤、URL 长度上限、方法白名单、CORS 白名单 |
 | 安全响应头 | HSTS、CSP、`X-Content-Type-Options`、`Referrer-Policy` 等 |
-| 缓存提示 | 200/206 响应附加 `Cache-Control: max-age=CACHE_TTL`；带凭证请求自动降级为 `private` 并追加 `Vary` |
-| 可观测性 | `/healthz` 存活探针、结构化访问日志、`X-Performance-Metrics` 性能头 |
+| 缓存策略头 | 按资源分级输出 `Cache-Control`（immutable/metadata/mutable），带凭证请求自动降级为 `private, no-store` 并追加 `Vary` |
+| 可观测性 | `/healthz` 存活探针、结构化访问日志、`X-Performance-Metrics` 性能头（含 `cache` 字段） |
 
 ## 与官方版的差异
 
-本移植版是 **标准版**：聚焦"前缀加速 + 流式转发"主干，官方版的边缘缓存与部分增值能力不在范围内。
+v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。
 
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
 | 部署形态 | Cloudflare Workers / Docker(workerd) | **单二进制 / systemd / Docker / 裸机** |
-| 平台前缀 | 100+ 全量 | 核心 23 个高频平台 |
+| 平台前缀 | 官方目录 84 项 | ✅ **84 项全量一致** |
 | URL 前缀改写 + 转发 | ✅ | ✅ |
 | Range 断点续传 | ✅ | ✅ |
 | 3 次线性退避重试 + 超时 | ✅ | ✅（超时只约束"响应头到达"，大文件流式传输不限时） |
 | HEAD Content-Length 回填探测 | ✅ | ✅ |
 | 安全响应头 (HSTS/CSP 等) | ✅ | ✅ |
 | 请求校验（穿越/控制字符/方法白名单） | ✅ | ✅ |
-| `X-Performance-Metrics` 性能头 | ✅ | ✅ |
+| `X-Performance-Metrics` 性能头 | ✅ | ✅（含 `cache` 命中字段） |
 | Git 智能 header 优化 / push | ✅ | ✅ 基础版（header 透传，clone/pull/LFS 实测可用） |
-| Docker 私有仓库登录链 (`/v2/auth`) | ✅ | ❌ 仅公共镜像匿名拉取（含匿名 token 自动重试），`/v2/auth` 返回 `501` |
-| AI 推理前缀 (`ip-*`) / 内容重写 | ✅ | ❌ |
-| 边缘缓存 (Cloudflare Cache API) | ✅ | ❌（纯透传，依赖上游 CDN） |
+| Docker 私有仓库登录链 (`/v2/auth`) | ✅ | ✅ 完整实现（含匿名 token 自动重试、合成 401 挑战指向本实例） |
+| AI 推理前缀 (`ip-*`) | ✅ | ✅ 28 家全量 |
+| 内容改写 (PyPI/npm/Flatpak) | ✅ | ✅ |
+| 缓存 | Cloudflare Cache API（边缘） | ✅ 磁盘缓存层（同源 URL 键、同 TTL 分级、LRU 驱逐） |
 
 ## 支持的平台前缀
 
@@ -84,12 +90,14 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 | `gl` | `gitlab.com` | GitLab |
 | `gitea` | `gitea.com` | Gitea |
 | `codeberg` | `codeberg.org` | Codeberg |
+| `sf` | `sourceforge.net` | SourceForge |
+| `aosp` | `android.googlesource.com` | Android AOSP |
 
 ### AI / 模型仓库
 
 | 前缀 | 上游 | 典型用途 |
 |------|------|----------|
-| `hf` | `huggingface.co` | 模型/数据集文件、`HF_ENDPOINT` |
+| `hf` | `huggingface.co` | 模型/数据集文件、`HF_ENDPOINT`、`/hf/api` 透传 |
 | `civitai` | `civitai.com` | 模型下载 API |
 
 ### 包管理
@@ -97,26 +105,78 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 | 前缀 | 上游 | 典型用途 |
 |------|------|----------|
 | `npm` | `registry.npmjs.org` | npm/yarn/pnpm registry |
-| `pypi` | `pypi.org` | pip 索引 `/pypi/simple/` |
+| `pypi` | `pypi.org` | pip 索引 `/pypi/simple/`（HTML 自动改写） |
 | `pypi-files` | `files.pythonhosted.org` | pip 包文件下载（手动构造 URL） |
 | `conda` | `repo.anaconda.com` | Anaconda 官方频道 |
 | `conda-community` | `conda.anaconda.org` | conda-forge 等社区频道 |
 | `maven` | `repo1.maven.org` | Maven Central |
-| `golang` | `proxy.golang.org` | `GOPROXY` |
-| `crates` | `crates.io` | Cargo（自动改写到 `/api/v1/crates`） |
-| `nuget` | `api.nuget.org` | NuGet v3 |
+| `apache` | `downloads.apache.org` | Apache 发行包 |
+| `gradle` | `plugins.gradle.org` | Gradle 插件 |
+| `homebrew` | `github.com/Homebrew` | Homebrew 仓库 |
+| `homebrew-api` | `formulae.brew.sh/api` | Homebrew API |
+| `homebrew-bottles` | `ghcr.io` | Homebrew 二进制瓶 |
 | `rubygems` | `rubygems.org` | Bundler 镜像 |
+| `cran` | `cran.r-project.org` | R 包 |
+| `cpan` | `www.cpan.org` | Perl CPAN |
+| `ctan` | `tug.ctan.org` | TeX CTAN |
+| `golang` | `proxy.golang.org` | `GOPROXY` |
+| `nuget` | `api.nuget.org` | NuGet v3 |
+| `crates` | `crates.io` | Cargo（自动改写到 `/api/v1/crates`） |
+| `packagist` | `repo.packagist.org` | Composer |
+| `flathub` | `dl.flathub.org` | Flatpak（`.flatpakrepo` 自动改写） |
 
-### 容器镜像
+### Linux 发行版
 
 | 前缀 | 上游 | 典型用途 |
 |------|------|----------|
-| `cr-docker` | `registry-1.docker.io` | Docker Hub |
-| `cr-ghcr` | `ghcr.io` | GitHub Container Registry |
-| `cr-quay` | `quay.io` | Quay.io |
-| `cr-gcr` | `gcr.io` | Google Container Registry |
-| `cr-mcr` | `mcr.microsoft.com` | Microsoft Artifact Registry |
-| `cr-k8s` | `registry.k8s.io` | Kubernetes 镜像 |
+| `debian` | `deb.debian.org` | apt 源 |
+| `ubuntu` | `archive.ubuntu.com` | apt 源 |
+| `fedora` | `mirrors.kernel.org/fedora` | dnf 源（`/pub/fedora/linux` 前缀自动剥离） |
+| `rocky` | `download.rockylinux.org` | Rocky Linux |
+| `opensuse` | `download.opensuse.org` | openSUSE |
+| `arch` | `geo.mirror.pkgbuild.com` | pacman 源 |
+
+### 其他资源
+
+| 前缀 | 上游 | 典型用途 |
+|------|------|----------|
+| `arxiv` | `arxiv.org` | 论文 PDF |
+| `fdroid` | `f-droid.org` | F-Droid 应用 |
+| `jenkins` | `updates.jenkins.io` | Jenkins 插件/更新 |
+
+### AI 推理（28 家，POST/流式透传）
+
+| 前缀 | 上游 | 前缀 | 上游 |
+|------|------|------|------|
+| `ip-openai` | `api.openai.com` | `ip-huggingface` | `router.huggingface.co` |
+| `ip-anthropic` | `api.anthropic.com` | `ip-together` | `api.together.xyz` |
+| `ip-gemini` | `generativelanguage.googleapis.com` | `ip-replicate` | `api.replicate.com` |
+| `ip-vertexai` | `aiplatform.googleapis.com` | `ip-fireworks` | `api.fireworks.ai` |
+| `ip-cohere` | `api.cohere.ai` | `ip-nebius` | `api.studio.nebius.ai` |
+| `ip-mistralai` | `api.mistral.ai` | `ip-jina` | `api.jina.ai` |
+| `ip-xai` | `api.x.ai` | `ip-voyageai` | `api.voyageai.com` |
+| `ip-githubmodels` | `models.github.ai` | `ip-falai` | `fal.run` |
+| `ip-nvidiaapi` | `integrate.api.nvidia.com` | `ip-novita` | `api.novita.ai` |
+| `ip-perplexity` | `api.perplexity.ai` | `ip-burncloud` | `ai.burncloud.com` |
+| `ip-braintrust` | `api.braintrust.dev` | `ip-openrouter` | `openrouter.ai` |
+| `ip-groq` | `api.groq.com` | `ip-poe` | `api.poe.com` |
+| `ip-cerebras` | `api.cerebras.ai` | `ip-featherlessai` | `api.featherless.ai` |
+| `ip-sambanova` | `api.sambanova.ai` | `ip-hyperbolic` | `api.hyperbolic.xyz` |
+| `ip-siray` | `api.siray.ai` | | |
+
+### 容器镜像（17 家）
+
+| 前缀 | 上游 | 前缀 | 上游 |
+|------|------|------|------|
+| `cr-docker` | `registry-1.docker.io` | `cr-cloudsmith` | `docker.cloudsmith.io` |
+| `cr-ghcr` | `ghcr.io` | `cr-digitalocean` | `registry.digitalocean.com` |
+| `cr-quay` | `quay.io` | `cr-vmware` | `projects.registry.vmware.com` |
+| `cr-gcr` | `gcr.io` | `cr-k8s` | `registry.k8s.io` |
+| `cr-mcr` | `mcr.microsoft.com` | `cr-heroku` | `registry.heroku.com` |
+| `cr-ecr` | `public.ecr.aws` | `cr-suse` | `registry.suse.com` |
+| `cr-gitlab` | `registry.gitlab.com` | `cr-opensuse` | `registry.opensuse.org` |
+| `cr-redhat` | `registry.redhat.io` | `cr-gitpod` | `registry.gitpod.io` |
+| `cr-oracle` | `container-registry.oracle.com` | | |
 
 ---
 
@@ -127,7 +187,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v1.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+./build.sh v2.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
 
 # 前台试用（默认 8080 端口、无鉴权 —— 仅限内网/本机！）
@@ -175,7 +235,7 @@ sudo apt install golang-go
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v1.0.0                          # linux-amd64 / linux-arm64 / darwin-arm64
+./build.sh v2.0.0                          # linux-amd64 / linux-arm64 / darwin-arm64
 # 或只构建当前平台：
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o xget-linux-amd64 .
 ```
@@ -207,7 +267,7 @@ PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
 启动日志示例：
 
 ```
-xget-go v1.0.0 starting — port=8080 auth=token retries=3 timeout=30s platforms=23
+xget-go v2.0.0 starting — port=8080 auth=token retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
 listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```
 
@@ -220,7 +280,7 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
-xget-go --version        # → xget-go v1.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
+xget-go --version        # → xget-go v2.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
 ```
 
@@ -418,12 +478,29 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 | `MAX_RETRIES` | `3` | 上游请求失败的最大尝试次数 |
 | `RETRY_DELAY_MS` | `1000` | 线性退避基数：第 N 次重试前等待 `N × RETRY_DELAY_MS` 毫秒 |
 | `MAX_PATH_LENGTH` | `2048` | URL 路径长度上限，超长返回 `414` |
-| `CACHE_TTL` | `1800` | 200/206 响应附加的 `Cache-Control: max-age` 提示（秒）。带 `Authorization`/`Cookie` 的请求自动降级为 `private, max-age=…` 并追加 `Vary: Authorization, Cookie` |
-| `ALLOWED_METHODS` | `GET,HEAD` | 非 Git/LFS/Docker 协议请求的方法白名单。需要 npm publish 等写操作时可追加 `PUT,POST` |
+| `CACHE_TTL` | `300` | 可变资源的磁盘缓存 TTL（秒），同时作为 `Cache-Control: s-maxage` 提示。与官方 `CACHE_DURATION` 默认值一致 |
+| `CACHE_DIR` | `cache` | 磁盘缓存目录（相对工作目录）；设为 `off`/`none` 关闭缓存，回到纯透传模式 |
+| `CACHE_MAX_MB` | `1024` | 缓存总容量预算（MB），超出后按 LRU 驱逐 |
+| `CACHE_MAX_FILE_MB` | `512` | 单个缓存条目上限（MB），更大的文件只透传不缓存 |
+| `ALLOWED_METHODS` | `GET,HEAD` | 非协议请求的方法白名单。需要 npm publish 等写操作时可追加 `PUT,POST` |
 | `ALLOWED_ORIGINS` | `*` | CORS 允许来源，逗号分隔。生产建议收紧为具体域名 |
 | `HOMEPAGE_URL` | 官方仓库 | 访问 `/` 与未知前缀时 `302` 跳转的目标 |
 
-Git/LFS/Docker 协议请求不受 `ALLOWED_METHODS` 约束（协议白名单自动放宽），保证 `git push`、`docker push` 等带 body 的方法可用。
+Git/LFS/Docker/AI/Hugging Face 协议请求不受 `ALLOWED_METHODS` 约束（协议白名单自动放宽为 `GET, HEAD, POST, PUT, PATCH, DELETE`），保证 `git push`、`docker push`、AI 聊天补全等带 body 的方法可用。
+
+### 缓存分级策略
+
+与官方 `cache-policy` 同构，按资源类型自动分级：
+
+| 级别 | 判定 | 磁盘 TTL | 浏览器提示 |
+|------|------|----------|------------|
+| 不可变产物 | npm `.tgz`、PyPI 版本化包文件、Maven 非 SNAPSHOT、crates `.crate`、rubygems `.gem`、GitHub release 附件（带版本 tag） | 86400s | `max-age=3600, immutable` |
+| 元数据/索引 | npm 包元数据、`/pypi/simple/`、`maven-metadata.xml`、flathub summary | 60s | `max-age=0, must-revalidate` |
+| 可变资源 | 其余 200 GET | `CACHE_TTL`（默认 300s） | `max-age=0, must-revalidate` |
+| 私有 | 请求带 `Authorization`/`Cookie`，或上游返回 `Set-Cookie`/`private` | 不缓存 | `private, no-store` + `Vary` |
+| 旁路 | Git/LFS/Docker/AI/HF 协议、非 GET/HEAD | 不缓存 | `no-store` |
+
+命中缓存时 `X-Performance-Metrics` 带 `"cache":"hit"`，未命中为 `"cache":"edge"`。带凭证请求永不缓存，缓存命中同样支持 `Range` 断点切片。
 
 ### 日志格式
 
@@ -475,13 +552,10 @@ git -c http.extraHeader="X-Xget-Token: $XGET_TOKEN" \
 # GitHub 上游凭证交给 credential helper 处理即可
 ```
 
-### Docker 场景的特殊限制
+### Docker 场景说明
 
-`daemon.json` 的 `registry-mirrors` 无法携带自定义头，因此：
-
-- 开启 `ACCESS_TOKEN` 后，**Docker 镜像加速不可用**（拉取会被 401 拒绝）
-- 解决方案：用防火墙/安全组把端口限制到可信网段（内网/VPN），这种部署可以不设 token
-- `/v2/auth` 私有仓库登录链属完整版能力，标准版返回 `501`（见 [路线图](#路线图)）
+- **私有镜像**：`docker login <实例域名>[/cr/<仓库>]` 后即可拉取私有镜像（凭证经 `/v2/auth` 登录链与上游交换，实例不存储凭证）
+- **`daemon.json` 的 `registry-mirrors` 无法携带任何自定义头**，因此开启 `ACCESS_TOKEN` 后镜像源模式不可用（拉取被 401 拒绝）——镜像源场景请用防火墙/安全组限制到可信网段并不设 token，或改用全路径拉取 `docker pull <实例>/cr/<仓库>/<镜像>`（登录链可用）
 
 ## 使用示例
 
@@ -535,19 +609,41 @@ hf download bert-base-uncased
 wget "https://xget.example.com/civitai/api/download/models/128713"
 ```
 
+### AI 推理代理（28 家）
+
+前缀即终端，凭证直接使用各家的 API Key（经本实例转发，实例不存储）：
+
+```bash
+# OpenAI SDK
+export OPENAI_BASE_URL=https://xget.example.com/ip/openai/v1
+export OPENAI_API_KEY=sk-...
+
+# Anthropic SDK
+export ANTHROPIC_BASE_URL=https://xget.example.com/ip/anthropic
+
+# Google Gemini REST
+curl "https://xget.example.com/ip/gemini/v1beta/models?key=$GEMINI_KEY"
+
+# 任意 OpenAI 兼容服务（Groq / OpenRouter / DeepSeek 类）
+curl https://xget.example.com/ip/groq/openai/v1/chat/completions \
+  -H "Authorization: Bearer $GROQ_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"llama-3.3-70b-versatile","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# Hugging Face Inference Router
+export HF_INFERENCE_ENDPOINT=https://xget.example.com/ip/huggingface
+```
+
+> POST 请求体与 SSE 流式响应原样透传，不缓存、不改写、不记录 body；错误响应（如 401）原样返回上游格式，便于 SDK 直接解析。
+
 ### 语言包管理器
 
 ```bash
 # npm / yarn / pnpm
 npm config set registry https://xget.example.com/npm/
 
-# pip（索引/元数据加速）
+# pip（索引与包文件均已自动联动：索引页 HTML 内的文件链接自动改写到 /pypi/files/）
 pip config set global.index-url https://xget.example.com/pypi/simple/
 pip config set global.trusted-host xget.example.com   # 仅 HTTP 部署需要
-# ⚠️ 标准版无内容改写：pip 从索引页解析出的包文件 URL 仍直连
-# files.pythonhosted.org（官方版会自动改写到 /pypi/files/）。如需文件也加速，
-# 将文件 URL 手动替换为 /pypi/files/ 前缀：
-#   https://xget.example.com/pypi/files/packages/py3/r/requests/requests-2.31.0-py3-none-any.whl
 
 # conda（/conda/ 后接上游原始路径；社区频道为 /conda/community/）
 conda config --add channels https://xget.example.com/conda/pkgs/main
@@ -628,14 +724,16 @@ docker run -d --name xget ... xget-go:新版本
 
 | 症状 | 可能原因 | 处理 |
 |------|----------|------|
-| `401 Unauthorized` | 未带 token / token 错误 / Bearer 被 Docker mirror 场景拦截 | 检查 `X-Xget-Token`；Docker mirror 见[鉴权详解](#docker-场景的特殊限制) |
-| `docker pull` 401 但 `curl` 正常 | `daemon.json` mirror 无法带 token | 关 `ACCESS_TOKEN` + 防火墙限内网，或直接用 `host/cr/...` 全路径拉取 |
+| `401 Unauthorized` | 未带 token / token 错误 / Bearer 被 Docker mirror 场景拦截 | 检查 `X-Xget-Token`；Docker 场景见[鉴权详解](#docker-场景说明) |
+| `docker pull` 401 但 `curl` 正常 | `daemon.json` mirror 无法带 token | 关 `ACCESS_TOKEN` + 防火墙限内网，或用 `host/cr/...` 全路径拉取（可 `docker login`） |
+| 私有镜像 401（已 docker login） | 登录链要求实例可直达上游 token 服务 | 检查上游 registry 与其 token 服务连通性；确认 realm 指向本实例 `/cr/<仓库>/v2/auth` |
 | `400` 提示路径非法 | URL 含 `..` 穿越或控制字符 | 属预期防护，检查拼接逻辑 |
 | `405 Method not allowed` | 非协议请求用了白名单外方法（如 npm publish 的 `PUT`） | `ALLOWED_METHODS=GET,HEAD,PUT,POST` |
 | `414` | URL 超过 `MAX_PATH_LENGTH` | 调大或缩短路径 |
 | `502/504` 且日志 `attempts=3` | 上游不可达（服务器出网被限/DNS 故障/上游宕机） | `curl -v <上游URL>` 自测出网；检查安全组出方向 |
-| `501` 访问 `/v2/auth` | 标准版无 Docker 登录链 | 属预期；私有镜像需完整版能力 |
 | 下载无进度条/无文件大小 | 上游 chunked 无 `Content-Length` | 已内置 HEAD/Range 探测回填；仍缺失则上游本身无长度信息 |
+| 缓存不生效 | 带 `Authorization`/`Cookie`（永不缓存）或资源属旁路类 | 去掉凭证头重试；观察 `X-Performance-Metrics` 的 `cache` 字段 |
+| 磁盘占用过高 | `CACHE_MAX_MB` 预算过大或热点资源多 | 调小预算（LRU 自动驱逐）或 `CACHE_DIR=off` 关闭缓存 |
 | 首字节慢但下载快 | 上游冷启动/重试退避中 | 观察 `X-Performance-Metrics` 的 `attempts`；调小 `RETRY_DELAY_MS` |
 | `git push` 被拒 | 上游凭证缺失/权限不足 | xget-go 只透传，凭证问题直接查上游（GitHub 需 PAT） |
 
@@ -669,35 +767,38 @@ Dockerfile + .dockerignore   多阶段镜像构建（golang:1.23 编译 → alpi
 请求管线（一次代理的完整路径）：
 
 ```
-healthz? → token 鉴权 → 协议识别(Git/LFS/Docker) → CORS 预检
+healthz? → token 鉴权 → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 → Docker /v2 探针 → 裸前缀 302 → 校验(穿越/长度/方法) → 平台最长前缀匹配
-→ 路径改写(crates、/v2/cr 归一化) → 上游转发(重试+线性退避)
-→ 响应终结(错误包装/跳段头剥离/缓存提示/安全头/性能头) → 流式回写
+→ 路径改写(crates、/v2/cr 归一化) → 缓存查询 → 上游转发(重试+线性退避)
+→ 响应终结(错误包装/文本改写/跳段头剥离/分级Cache-Control/安全头/性能头)
+→ 边下载边写缓存(T形流) / 缓存命中直接切片服务
 ```
 
 ## 实测覆盖场景
 
-v1.0.0 发布前以下场景均在本机实测通过：
+v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）：
 
 - `git clone` / `ls-remote`（GitHub）、Git 协议 header 透传
-- GitHub release 下载（80 MB 文件 HEAD Content-Length 探测回填）
-- `Range: bytes=...` → `206 Partial Content` 断点续传
-- npm / PyPI 元数据与包文件、Go modules（`GOPROXY`）
-- Docker manifest 拉取（匿名 token 401→重试链）、`/v2` API 探针
-- Hugging Face `resolve` 文件下载
-- 路径穿越 `..` → `400`；方法白名单外 → `405`；URL 超长 → `414`
-- token 鉴权三通道：缺 token `401`、错误 token `401`、三方式各 `200`
-- `/healthz` 免鉴权；未知前缀与裸前缀 → `302` 主页
+- GitHub release 下载（HEAD Content-Length 探测回填）、`Range` → `206` 断点续传
+- **磁盘缓存**：首次 `miss` 落盘 → 二次 `hit`（0.2ms 级）、缓存命中 Range 切片、带 Cookie 请求 `private/no-store` 不缓存、LRU 驱逐（1MB 预算下旧条目被逐出）
+- **Docker 登录链**：`/cr/docker/v2/auth` 换取 token、`/cr/ghcr/v2/auth`、非法 scope `400`、裸 `/v2/auth` `400`、manifest 匿名 token 链 `200`、对拒绝资源返回指向本实例的合成 401 挑战
+- **AI 前缀**：`/ip/openrouter/api/v1/models` 200；`/ip/openai` 错误体原样透传（无包装）；POST 透传
+- **HF 协议**：`/hf/api/models` 200
+- **内容改写**：PyPI HTML → `/pypi/files/`、npm JSON → `/npm/`、flathub `.flatpakrepo` → `/flathub/repo/`（上游直链零残留）
+- **新平台**：debian/arch/cran/apache/aosp 可达；fedora `/pub/fedora/linux` 前缀剥离与直路径双形态 200
+- 路径穿越 `..` → `400`；方法白名单外 → `405`
+- token 鉴权三通道：缺 token `401`、错误 token `401`、`X-Xget-Token`/query 各 `200`、`/healthz` 免鉴权
 
 ## 路线图
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| 磁盘缓存层 | 规划中 | 热点资源本地缓存（对齐官方 Cache API 行为），可配容量与 TTL |
-| AI 推理前缀 (`ip-*`) | 规划中 | OpenAI/Anthropic 等 API 代理与内容重写 |
-| `/v2/auth` 完整登录链 | 规划中 | Docker 私有仓库 `docker login` 支持 |
+| ~~磁盘缓存层~~ | ✅ v2.0.0 | 三级 TTL 分级 + LRU 驱逐，`CACHE_DIR/CACHE_MAX_MB/CACHE_MAX_FILE_MB` 可配 |
+| ~~AI 推理前缀 (`ip-*`)~~ | ✅ v2.0.0 | 28 家全量，POST/流式透传 |
+| ~~`/v2/auth` 完整登录链~~ | ✅ v2.0.0 | Docker 私有仓库 `docker login` 支持 |
+| ~~平台目录全量~~ | ✅ v2.0.0 | 23 → 84 项，与官方目录一致 |
 | 监听地址选项 | 规划中 | `BIND_ADDR` 环境变量，支持仅绑定内网 IP |
-| Prometheus 指标 | 评估中 | `/metrics` 端点暴露请求计数与延迟直方图 |
+| Prometheus 指标 | 评估中 | `/metrics` 端点暴露请求计数、缓存命中率与延迟直方图 |
 
 ## 致谢与许可证
 
