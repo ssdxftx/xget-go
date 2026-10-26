@@ -50,12 +50,12 @@ var Catalog = map[string]string{
 	"flathub":          "https://dl.flathub.org",
 
 	// Linux Distributions
-	"debian":  "https://deb.debian.org",
-	"ubuntu":  "https://archive.ubuntu.com",
-	"fedora":  "https://mirrors.kernel.org/fedora",
-	"rocky":   "https://download.rockylinux.org",
+	"debian":   "https://deb.debian.org",
+	"ubuntu":   "https://archive.ubuntu.com",
+	"fedora":   "https://mirrors.kernel.org/fedora",
+	"rocky":    "https://download.rockylinux.org",
 	"opensuse": "https://download.opensuse.org",
-	"arch":    "https://geo.mirror.pkgbuild.com",
+	"arch":     "https://geo.mirror.pkgbuild.com",
 
 	// Other Resources
 	"arxiv":   "https://arxiv.org",
@@ -198,6 +198,8 @@ func TransformPath(effectivePath, key string) string {
 		return transformCratesPath(stripped)
 	case "fedora":
 		return transformFedoraPath(stripped)
+	case "jenkins":
+		return transformJenkinsPath(stripped)
 	}
 	return stripped
 }
@@ -222,6 +224,28 @@ func transformFedoraPath(p string) string {
 		return strings.TrimPrefix(p, marker)
 	}
 	return p
+}
+
+// transformJenkinsPath pins update-center requests to the /current channel,
+// port of transformJenkinsPath: /experimental, /download and /current pass
+// through, /update-center(.actual).json maps to /current/..., everything
+// else is rooted under /current.
+func transformJenkinsPath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		return p
+	}
+	if p == "/update-center.json" {
+		return "/current/update-center.json"
+	}
+	if p == "/update-center.actual.json" {
+		return "/current/update-center.actual.json"
+	}
+	if strings.HasPrefix(p, "/experimental/") ||
+		strings.HasPrefix(p, "/download/") ||
+		strings.HasPrefix(p, "/current/") {
+		return p
+	}
+	return "/current" + p
 }
 
 // IsContainer reports whether the platform is a container registry.

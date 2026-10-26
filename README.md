@@ -58,7 +58,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 ## 与官方版的差异
 
-v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。
+v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。
 
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
@@ -71,11 +71,13 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 | 安全响应头 (HSTS/CSP 等) | ✅ | ✅ |
 | 请求校验（穿越/控制字符/方法白名单） | ✅ | ✅ |
 | `X-Performance-Metrics` 性能头 | ✅ | ✅（含 `cache` 命中字段） |
-| Git 智能 header 优化 / push | ✅ | ✅ 基础版（header 透传，clone/pull/LFS 实测可用） |
+| Git 智能 header 优化 / push | ✅ | ✅（header 透传 + 协议缺省头回填，clone/pull/push/LFS 实测可用） |
 | Docker 私有仓库登录链 (`/v2/auth`) | ✅ | ✅ 完整实现（含匿名 token 自动重试、合成 401 挑战指向本实例） |
 | AI 推理前缀 (`ip-*`) | ✅ | ✅ 28 家全量 |
 | 内容改写 (PyPI/npm/Flatpak) | ✅ | ✅ |
-| 缓存 | Cloudflare Cache API（边缘） | ✅ 磁盘缓存层（同源 URL 键、同 TTL 分级、LRU 驱逐） |
+| 缓存 | Cloudflare Cache API（边缘） | ✅ 磁盘缓存层（同源 URL 键、同 TTL 分级、LRU 驱逐、改写内容按请求来源区分缓存键） |
+
+> 平台差异（已知限制）：路径中出现**非法百分号序列**（如 `100%.txt`）时，Go 的标准 HTTP 栈在连接解析层直接返回 400，而 Cloudflare Workers 会放行给上游处理。该场景仅影响文件名本身含裸 `%` 的极端 URL；合法的百分号编码（`%2e`、`%2f` 等）行为与官方完全一致。
 
 ## 支持的平台前缀
 
@@ -187,7 +189,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v2.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+./build.sh v2.0.1        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
 
 # 前台试用（默认 8080 端口、无鉴权 —— 仅限内网/本机！）
@@ -235,7 +237,7 @@ sudo apt install golang-go
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v2.0.0                          # linux-amd64 / linux-arm64 / darwin-arm64
+./build.sh v2.0.1                          # linux-amd64 / linux-arm64 / darwin-arm64
 # 或只构建当前平台：
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o xget-linux-amd64 .
 ```
@@ -267,7 +269,7 @@ PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
 启动日志示例：
 
 ```
-xget-go v2.0.0 starting — port=8080 auth=token retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
+xget-go v2.0.1 starting — port=8080 auth=token retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
 listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```
 
@@ -280,7 +282,7 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
-xget-go --version        # → xget-go v2.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
+xget-go --version        # → xget-go v2.0.1 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
 ```
 
@@ -776,7 +778,7 @@ healthz? → token 鉴权 → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 
 ## 实测覆盖场景
 
-v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）：
+v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、token 鉴权、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿：
 
 - `git clone` / `ls-remote`（GitHub）、Git 协议 header 透传
 - GitHub release 下载（HEAD Content-Length 探测回填）、`Range` → `206` 断点续传

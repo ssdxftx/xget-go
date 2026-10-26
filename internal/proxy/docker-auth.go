@@ -75,11 +75,13 @@ func (authTargetError) Error() string { return "Unsupported registry platform in
 
 var errUnsupportedRegistry error = authTargetError{}
 
-// handleDockerAuth implements the /v2/auth endpoint.
-func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path string) {
+// handleDockerAuth implements the /v2/auth endpoint. localError is the
+// caller's locally-generated-response writer so error replies carry the
+// same global header set as every other response.
+func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path string, traits Traits, localError func(Traits, string, int)) {
 	key, scope, err := resolveDockerAuthTarget(path, r.URL.Query().Get("scope"))
 	if err != nil {
-		security.WriteError(w, r, "Invalid Docker authentication request", http.StatusBadRequest, false)
+		localError(traits, "Invalid Docker authentication request", http.StatusBadRequest)
 		return
 	}
 	upstream := platform.Catalog[key]
@@ -87,12 +89,12 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	// 1. Probe the upstream /v2/ endpoint for its auth challenge.
 	v2req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream+"/v2/", nil)
 	if err != nil {
-		security.WriteError(w, r, "Invalid upstream request", http.StatusBadRequest, false)
+		localError(traits, "Invalid upstream request", http.StatusBadRequest)
 		return
 	}
 	v2resp, err := h.client.Do(v2req) // follows redirects, like the original
 	if err != nil {
-		security.WriteError(w, r, "Registry unreachable", http.StatusBadGateway, false)
+		localError(traits, "Registry unreachable", http.StatusBadGateway)
 		return
 	}
 
@@ -111,6 +113,7 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 			}
 		}
 		security.AddSecurityHeaders(hdr)
+		security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.methodAllowed(traits))
 		w.WriteHeader(resp.StatusCode)
 		if r.Method != http.MethodHead && resp.Body != nil {
 			_, _ = io.Copy(w, resp.Body)
@@ -137,7 +140,7 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	// 2. Relay the client's credentials to the upstream token service.
 	treq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, challenge.TokenURL(scope), nil)
 	if err != nil {
-		security.WriteError(w, r, "Invalid token request", http.StatusBadRequest, false)
+		localError(traits, "Invalid token request", http.StatusBadRequest)
 		return
 	}
 	if auth := r.Header.Get("Authorization"); auth != "" {
@@ -145,7 +148,7 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	}
 	tres, err := h.client.Do(treq)
 	if err != nil {
-		security.WriteError(w, r, "Token service unreachable", http.StatusBadGateway, false)
+		localError(traits, "Token service unreachable", http.StatusBadGateway)
 		return
 	}
 	forward(tres)
