@@ -5,7 +5,7 @@
 // This standard edition covers URL prefix acceleration, Range/partial
 // content, retry with linear backoff, HEAD content-length probing, Docker
 // anonymous-pull token retry, Git/LFS/Docker header passthrough, request
-// validation, security headers and optional instance token auth.
+// validation, security headers and upstream credential passthrough.
 //
 // Original project: https://github.com/xixu-me/Xget (AGPL-3.0-or-later)
 // This port inherits AGPL-3.0-or-later.
@@ -44,13 +44,11 @@ func main() {
 	cfg := config.FromEnv()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Printf("xget-go %s starting — port=%s auth=%s retries=%d timeout=%ds platforms=%d cache=%s",
-		version, cfg.Port, authLabel(cfg), cfg.MaxRetries, cfg.TimeoutSecond,
+	log.Printf("xget-go %s starting — port=%s retries=%d timeout=%ds platforms=%d cache=%s",
+		version, cfg.Port, cfg.MaxRetries, cfg.TimeoutSecond,
 		len(platform.Catalog), cacheLabel(cfg))
-	if cfg.AccessToken == "" {
-		log.Printf("WARNING: ACCESS_TOKEN is empty — the instance is open to anyone who can reach it. " +
-			"The official Xget README strongly recommends putting instances behind authentication or IP allowlists.")
-	}
+	log.Printf("auth: none (parity with the official Xget) — expose via a reverse " +
+		"proxy with auth or a firewall/allowlist if the instance must not be public")
 
 	h := proxy.New(cfg)
 
@@ -85,13 +83,6 @@ func main() {
 	log.Printf("bye")
 }
 
-func authLabel(cfg *config.Config) string {
-	if strings.TrimSpace(cfg.AccessToken) == "" {
-		return "disabled"
-	}
-	return "token"
-}
-
 func cacheLabel(cfg *config.Config) string {
 	if cfg.CacheDir == "" || strings.EqualFold(cfg.CacheDir, "off") || strings.EqualFold(cfg.CacheDir, "none") {
 		return "disabled"
@@ -108,7 +99,6 @@ Usage:
 
 Environment variables:
   PORT              listen port                          (default 8080)
-  ACCESS_TOKEN      instance token; empty disables auth  (default empty)
   TIMEOUT_SECONDS   per-attempt time-to-headers          (default 30)
   MAX_RETRIES       upstream retry attempts              (default 3)
   RETRY_DELAY_MS    linear backoff base                  (default 1000)
@@ -121,8 +111,9 @@ Environment variables:
   ALLOWED_ORIGINS   CORS origins, comma-separated        (default *)
   HOMEPAGE_URL      redirect target for /                (default upstream repo)
 
-Auth: send X-Xget-Token: <token> (keeps Authorization free for upstream) or
-Authorization: Bearer <token> (consumed by the proxy) or ?xget_token=<token>.
+Auth: none (same as the official Xget). Authorization and Cookie headers are
+forwarded to the upstream platform as-is; put the instance behind a reverse
+proxy with auth (or an IP allowlist) if it must not be public.
 
 Platforms:`, version)
 	for k := range platform.Catalog {

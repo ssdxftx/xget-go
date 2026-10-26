@@ -22,7 +22,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 - [快速开始](#快速开始)
 - [部署教程](#部署教程)（源码构建 / systemd / Docker / 反向代理 / HTTPS）
 - [配置参考](#配置参考)
-- [鉴权详解](#鉴权详解)
+- [鉴权与凭证透传](#鉴权与凭证透传)
 - [使用示例](#使用示例)
 - [运维手册](#运维手册)
 - [安全加固清单](#安全加固清单)
@@ -50,7 +50,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 | Hugging Face API | `/hf/api`、`/hf/token` 协议级透传，`Authorization` 保留 |
 | 内容改写 | PyPI 索引页、npm 元数据、Flatpak 描述文件中的上游链接自动改写回本实例 |
 | 磁盘缓存层 | 对齐官方三级 TTL 策略（immutable 86400s / metadata 60s / mutable 300s），LRU 驱逐、可配容量 |
-| 实例鉴权 | `X-Xget-Token` 头 / `Authorization: Bearer` / `?xget_token=` 三通道，常量时间比较 |
+| 实例鉴权 | **无**（与官方一致）：无实例级门禁，`Authorization` 等凭证头原样透传上游；对外防护交给反代 basic auth / IP 白名单（见[鉴权与凭证透传](#鉴权与凭证透传)） |
 | 请求校验 | 路径穿越拦截（`..`）、控制字符过滤、URL 长度上限、方法白名单、CORS 白名单 |
 | 安全响应头 | HSTS、CSP、`X-Content-Type-Options`、`Referrer-Policy` 等 |
 | 缓存策略头 | 按资源分级输出 `Cache-Control`（immutable/metadata/mutable），带凭证请求自动降级为 `private, no-store` 并追加 `Vary` |
@@ -58,7 +58,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 ## 与官方版的差异
 
-v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。
+v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
@@ -76,6 +76,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 | AI 推理前缀 (`ip-*`) | ✅ | ✅ 28 家全量 |
 | 内容改写 (PyPI/npm/Flatpak) | ✅ | ✅ |
 | 缓存 | Cloudflare Cache API（边缘） | ✅ 磁盘缓存层（同源 URL 键、同 TTL 分级、LRU 驱逐、改写内容按请求来源区分缓存键） |
+| 实例鉴权 | ❌ 无（官方建议自部署实例外置鉴权层） | ✅ **与官方一致**：无内置鉴权，`Authorization` 纯透传上游 |
 
 > 平台差异（已知限制）：路径中出现**非法百分号序列**（如 `100%.txt`）时，Go 的标准 HTTP 栈在连接解析层直接返回 400，而 Cloudflare Workers 会放行给上游处理。该场景仅影响文件名本身含裸 `%` 的极端 URL；合法的百分号编码（`%2e`、`%2f` 等）行为与官方完全一致。
 
@@ -189,20 +190,17 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v2.0.1        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+./build.sh v3.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
 
-# 前台试用（默认 8080 端口、无鉴权 —— 仅限内网/本机！）
+# 前台试用（默认 8080 端口 —— 仅限内网/本机！）
 xget-go
-
-# 生产运行：务必设置 token
-PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
 ```
 
 启动后验证：
 
 ```bash
-curl http://127.0.0.1:8080/healthz          # → ok（健康探针，免鉴权）
+curl http://127.0.0.1:8080/healthz          # → ok（健康探针）
 curl -sI "http://127.0.0.1:8080/gh/xixu-me/Xget" | head -5
 ```
 
@@ -262,18 +260,19 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o xget-linux-amd64 .
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 
-PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
+PORT=8080 xget-go
 # Ctrl+C 停止
 ```
 
 启动日志示例：
 
 ```
-xget-go v2.0.1 starting — port=8080 auth=token retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
+xget-go v3.0.0 starting — port=8080 retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
+auth: none (parity with the official Xget) — expose via a reverse proxy with auth or a firewall/allowlist if the instance must not be public
 listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```
 
-> ⚠️ 前台进程会随 SSH 会话断开而退出，生产环境请使用 systemd 或 Docker。
+> ⚠️ 前台进程会随 SSH 会话断开而退出，生产环境请使用 systemd 或 Docker。本服务**无内置鉴权**（与官方一致），公网部署务必配合反代鉴权或防火墙（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 ### 方式二：systemd 生产部署（推荐）
 
@@ -282,16 +281,15 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
-xget-go --version        # → xget-go v2.0.1 (port of xixu-me/Xget, AGPL-3.0-or-later)
+xget-go --version        # → xget-go v3.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
 ```
 
-**第 2 步：生成配置文件**（推荐用 `EnvironmentFile` 管理 token，避免明文写进 unit）
+**第 2 步：可选配置文件**（需要自定义端口等非默认值时才需要；本服务无内置鉴权，无需配置任何 token）
 
 ```bash
-sudo sh -c 'echo "ACCESS_TOKEN=$(openssl rand -hex 32)" > /etc/xget/xget.env'
-sudo chmod 600 /etc/xget/xget.env
-# 可按需追加：PORT=8080、TIMEOUT_SECONDS=30 等，见《配置参考》
+sudo sh -c 'echo "PORT=8080" > /etc/xget/xget.env'
+# 可按需追加：TIMEOUT_SECONDS=30、CACHE_DIR 等，见《配置参考》
 ```
 
 **第 3 步：安装服务单元**（仓库根目录已提供 `xget.service`，含安全加固）
@@ -309,7 +307,7 @@ EnvironmentFile=/etc/xget/xget.env        # ← 新增这一行
 # DynamicUser=yes / NoNewPrivileges=yes / ProtectSystem=strict ...
 ```
 
-> 仓库 unit 默认 `ExecStart=/usr/local/bin/xget-go`、`Environment=PORT=8080`；`DynamicUser=yes` 会让服务以随机非特权用户运行。若需自定义端口等，直接在 unit 里加 `Environment=XXX=...` 或写进 `/etc/xget/xget.env`。
+> 仓库 unit 默认 `ExecStart=/usr/local/bin/xget-go`、`Environment=PORT=8080`；`DynamicUser=yes` 会让服务以随机非特权用户运行。若需自定义端口等，直接在 unit 里加 `Environment=XXX=...` 或写进 `/etc/xget/xget.env`。**请勿把 8080 端口直接暴露公网**——本服务无内置鉴权，后续步骤的反代/防火墙是事实上的准入层。
 
 **第 4 步：启动并设置开机自启**
 
@@ -323,8 +321,7 @@ sudo systemctl status xget                # 确认 active (running)
 
 ```bash
 curl http://127.0.0.1:8080/healthz                                        # → ok
-curl -sI -H "X-Xget-Token: $(sudo cat /etc/xget/xget.env | cut -d= -f2)" \
-  "http://127.0.0.1:8080/gh/microsoft/vscode/archive/refs/heads/main.zip" | head -3
+curl -sI "http://127.0.0.1:8080/gh/microsoft/vscode/archive/refs/heads/main.zip" | head -3
 # → HTTP/1.1 200 OK（或 302 跟随到 release CDN，均为正常）
 ```
 
@@ -346,13 +343,12 @@ journalctl -u xget --since today   # 今日日志
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-docker build -t xget-go:1.0.0 .
+docker build -t xget-go:3.0.0 .
 
 docker run -d --name xget \
   -p 127.0.0.1:8080:8080 \
-  -e ACCESS_TOKEN="$(openssl rand -hex 32)" \
   --restart unless-stopped \
-  xget-go:1.0.0
+  xget-go:3.0.0
 
 # 验证
 curl http://127.0.0.1:8080/healthz    # → ok
@@ -367,11 +363,9 @@ docker logs -f xget                   # 查看日志
 services:
   xget:
     build: .
-    image: xget-go:1.0.0
+    image: xget-go:3.0.0
     ports:
       - "127.0.0.1:8080:8080"
-    environment:
-      - ACCESS_TOKEN=${XGET_TOKEN}     # 放在 .env 文件中
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
@@ -381,7 +375,7 @@ services:
 
 ### 反向代理与 HTTPS
 
-生产环境强烈建议套一层 HTTPS 反代：Git/Docker 客户端在纯 HTTP 下会遇到各种限制（明文 token、Docker 需要 `insecure-registries` 例外等），且反代可以缓冲慢客户端、隐藏后端进程。
+生产环境强烈建议套一层 HTTPS 反代：Git/Docker 客户端在纯 HTTP 下会遇到各种限制（凭证明文、Docker 需要 `insecure-registries` 例外等），且反代可以缓冲慢客户端、隐藏后端进程，**还能承担实例准入控制**（本服务与官方一致无内置鉴权）。
 
 #### Caddy（自动签发证书，最省事）
 
@@ -434,6 +428,24 @@ server {
 }
 ```
 
+#### 可选：反代层 basic auth（对外保护实例）
+
+本服务与官方 Xget 一样**没有内置鉴权**；官方 README 明确建议自部署实例"put it behind authentication, IP allowlists, or both"。在 Nginx 上加两层认证即可：
+
+```nginx
+# 全站 basic auth（htpasswd -bc /etc/nginx/xget.htpasswd user）
+location / {
+    auth_basic "Xget";
+    auth_basic_user_file /etc/nginx/xget.htpasswd;
+    proxy_pass http://127.0.0.1:8080;
+}
+
+# 或仅放行可信网段
+# allow 10.0.0.0/8; deny all;
+```
+
+> 注意：开启反代 basic auth 后，git clone 写法变为 `git clone https://user:pass@xget.example.com/gh/...`；Docker 场景改用 `docker login xget.example.com`。若实例仅内网使用，用防火墙/安全组限网段即可，无需 basic auth。
+
 证书签发（certbot）：
 
 ```bash
@@ -452,7 +464,7 @@ sudo firewall-cmd --permanent --add-service={http,https}
 sudo firewall-cmd --reload
 ```
 
-> xget-go 自身没有"仅绑定内网 IP"的选项（`PORT` 只决定端口）。若必须直接暴露（无反代），请用防火墙/安全组把端口限制到可信网段，并**务必**设置 `ACCESS_TOKEN`。
+> xget-go 自身没有"仅绑定内网 IP"的选项（`PORT` 只决定端口），也没有内置鉴权（与官方一致）。若必须直接暴露（无反代），请用防火墙/安全组把端口限制到可信网段。
 
 ### 部署验证清单
 
@@ -462,20 +474,18 @@ sudo firewall-cmd --reload
 curl -s https://xget.example.com/healthz                        # ① ok
 curl -sI https://xget.example.com/gh/ | head -1                 # ② 302（裸前缀跳主页）
 git clone https://xget.example.com/gh/octocat/Hello-World.git   # ③ git 加速
-docker pull xget.example.com/cr/docker/library/alpine:latest    # ④ 镜像加速（若未开 token）
+docker pull xget.example.com/cr/docker/library/alpine:latest    # ④ 镜像加速
 curl -s -o /dev/null -w "%{http_code}\n" \
-  -H "X-Xget-Token: <token>" \
   https://xget.example.com/hf/bert-base-uncased/resolve/main/config.json   # ⑤ 200
 ```
 
 ## 配置参考
 
-全部配置通过环境变量注入（与官方 Workers 版的变量名保持一致），无配置文件。
+全部配置通过环境变量注入（与官方 Workers 版的变量名保持一致），无配置文件。**没有 `ACCESS_TOKEN`**：v3.0.0 起与官方对齐，实例无内置鉴权（对外防护见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `8080` | 监听端口（监听 `0.0.0.0`） |
-| `ACCESS_TOKEN` | 空（**关闭鉴权**） | 实例访问 token。为空时实例对任何可达者开放，仅限内网 |
 | `TIMEOUT_SECONDS` | `30` | 单次尝试的"响应头超时"（秒）。只约束到上游建立连接并收到响应头；之后的流式传输不受此限制，大文件不会中途超时 |
 | `MAX_RETRIES` | `3` | 上游请求失败的最大尝试次数 |
 | `RETRY_DELAY_MS` | `1000` | 线性退避基数：第 N 次重试前等待 `N × RETRY_DELAY_MS` 毫秒 |
@@ -514,54 +524,68 @@ Git/LFS/Docker/AI/Hugging Face 协议请求不受 `ALLOWED_METHODS` 约束（协
 
 字段：客户端 IP、方法与路径、上游目标、命中平台、上游状态码、尝试次数、上游耗时、总耗时。
 
-## 鉴权详解
+## 鉴权与凭证透传
 
-设置 `ACCESS_TOKEN` 后，除 `/healthz` 外的所有请求必须携带实例 token，否则返回：
+**v3.0.0 起与官方 Xget 完全一致：本服务没有实例级鉴权。** 官方 Xget 自身不做任何访问控制，其 README 建议自部署者"put it behind authentication, IP allowlists, or both"——即把准入控制交给部署层（反代认证、IP 白名单、防火墙），本移植版遵循同一设计。所有进入实例的请求直接按平台前缀转发，不存在 401 门禁，也没有任何需要配置的 token 环境变量。
 
+凭证头按官方语义处理：`Authorization`、`Cookie`、`Proxy-Authorization` 等**原样透传给上游平台**，用于上游自身的鉴权（私有仓库下载、Git push、docker login、AI API key 等）。本实例不消费、不校验、不存储任何凭证；Docker 注册表重定向跟随时会剥离 `Authorization`（与官方 `followDockerRedirectIfNeeded` 一致，避免凭证泄漏到重定向后的其它主机）。带凭证的请求也永远不会写入磁盘缓存（`private, no-store` + `Vary: Authorization, Cookie`）。
+
+### 对外保护实例（替代旧版 ACCESS_TOKEN）
+
+从 v2.x 升级的用户请把准入控制移到部署层，任选其一或组合：
+
+**方案一：Nginx basic auth**（适合公网实例，配置见[反向代理与 HTTPS](#可选反代层-basic-auth对外保护实例)）：
+
+```nginx
+location / {
+    auth_basic "Xget";
+    auth_basic_user_file /etc/nginx/xget.htpasswd;
+    proxy_pass http://127.0.0.1:8080;
+}
 ```
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer realm="xget"
-{"error":"Unauthorized: missing or invalid access token","status":401,"timestamp":"..."}
-```
 
-三种携带方式（按优先级依次检测）：
-
-| 方式 | 示例 | 适用场景 |
-|------|------|----------|
-| `X-Xget-Token` 请求头 **（推荐）** | `curl -H "X-Xget-Token: $TOKEN" ...` | 不占用 `Authorization`，可**同时**透传上游凭证（私有仓库下载） |
-| `xget_token` 查询参数 | `?xget_token=$TOKEN` | `wget`、`aria2`、浏览器直接下载等不便自定义头的工具。转发前自动从 URL 剥离，不会泄漏给上游 |
-| `Authorization: Bearer <token>` | `curl -H "Authorization: Bearer $TOKEN" ...` | 兼容标准 Bearer。注意：此时 token 被**实例消费**，不会转发到上游 |
-
-Token 校验使用常量时间比较（`crypto/subtle`），防时序侧信道。
-
-### 典型组合
-
-**场景 A：实例开了 token + 下载 GitHub 私有仓库**
+**方案二：防火墙/安全组限网段**（适合内网或个人使用）：
 
 ```bash
-curl -H "X-Xget-Token: $XGET_TOKEN" \
-     -H "Authorization: Bearer $GH_PAT" \
+sudo ufw allow from 10.0.0.0/8 to any port 8080 proto tcp
+sudo ufw deny 8080/tcp
+```
+
+**方案三：仅绑定回环**（`-p 127.0.0.1:8080:8080` / 反代本机回环），让实例完全不可被外部直连。
+
+### 上游凭证透传示例
+
+**GitHub 私有仓库下载**（`Authorization` 直达 GitHub）：
+
+```bash
+curl -H "Authorization: Bearer $GH_PAT" \
      -LO "https://xget.example.com/gh/owner/private-repo/archive/main.tar.gz"
 ```
 
-`X-Xget-Token` 用于实例鉴权，`Authorization` 原样透传给 GitHub 完成上游鉴权 —— 两者互不干扰。
-
-**场景 B：实例开了 token + git clone**
+**git clone 私有仓库**（凭证交给 git credential helper，与本实例无关）：
 
 ```bash
-git -c http.extraHeader="X-Xget-Token: $XGET_TOKEN" \
-    clone https://xget.example.com/gh/owner/repo.git
-# GitHub 上游凭证交给 credential helper 处理即可
+git clone https://xget.example.com/gh/owner/private-repo.git
+# 提示输入用户名密码时填 GitHub 用户名与 PAT
+```
+
+**AI 推理 API key**（`/ip/*` 前缀，key 透传给推理商）：
+
+```bash
+curl -X POST "https://xget.example.com/ip/openai/v1/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ### Docker 场景说明
 
-- **私有镜像**：`docker login <实例域名>[/cr/<仓库>]` 后即可拉取私有镜像（凭证经 `/v2/auth` 登录链与上游交换，实例不存储凭证）
-- **`daemon.json` 的 `registry-mirrors` 无法携带任何自定义头**，因此开启 `ACCESS_TOKEN` 后镜像源模式不可用（拉取被 401 拒绝）——镜像源场景请用防火墙/安全组限制到可信网段并不设 token，或改用全路径拉取 `docker pull <实例>/cr/<仓库>/<镜像>`（登录链可用）
+- **私有镜像**：`docker login <实例域名>[/cr/<仓库>]` 后即可拉取私有镜像（凭证经 `/v2/auth` 登录链与上游交换，实例不存储凭证）。v3.0.0 起登录链不再被实例鉴权拦截，Basic 凭证畅通无阻
+- **`daemon.json` 镜像源模式**：因实例无鉴权，`registry-mirrors` 直接可用，无需任何特殊配置
+- **公开镜像加速**：无需登录，直接 `docker pull <实例>/cr/<仓库>/<镜像>`
 
 ## 使用示例
 
-以下示例统一使用 `https://xget.example.com`，请替换为你的域名（或 `http://IP:8080`）。若已开启 token，curl/wget 场景请自行加上 `-H "X-Xget-Token: ..."` 或 `?xget_token=`。
+以下示例统一使用 `https://xget.example.com`，请替换为你的域名（或 `http://IP:8080`）。实例无鉴权（与官方一致），上游需要的凭证（GitHub PAT、AI API key 等）直接用 `Authorization` 头传递即可，本实例会原样透传（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 ### Git 仓库加速
 
@@ -702,7 +726,7 @@ docker pull alpine:latest        # 自动经镜像源
 
 | 探针 | 说明 |
 |------|------|
-| `GET /healthz` | 存活探针，**免鉴权**恒定返回 `ok`。适合负载均衡健康检查、Uptime Kuma、k8s livenessProbe |
+| `GET /healthz` | 存活探针，恒定返回 `ok`。适合负载均衡健康检查、Uptime Kuma、k8s livenessProbe |
 | `X-Performance-Metrics` 响应头 | 非 Git/LFS/Docker 请求附带 JSON：`{"total_ms":143.4,"upstream_ms":143.2,"attempts":1,"platform":"gh"}`，可采样统计上游延迟 |
 
 监控建议：对 `/healthz` 做 30s 间隔探活；对热门 release 抽样记录 `upstream_ms` 观察上游质量；`attempts > 1` 频繁出现说明上游不稳，可调大 `MAX_RETRIES`/`RETRY_DELAY_MS`。
@@ -726,9 +750,9 @@ docker run -d --name xget ... xget-go:新版本
 
 | 症状 | 可能原因 | 处理 |
 |------|----------|------|
-| `401 Unauthorized` | 未带 token / token 错误 / Bearer 被 Docker mirror 场景拦截 | 检查 `X-Xget-Token`；Docker 场景见[鉴权详解](#docker-场景说明) |
-| `docker pull` 401 但 `curl` 正常 | `daemon.json` mirror 无法带 token | 关 `ACCESS_TOKEN` + 防火墙限内网，或用 `host/cr/...` 全路径拉取（可 `docker login`） |
+| 私有仓库/镜像 401 | 上游拒绝（凭证无效/过期/无权限） | 本实例不拦截凭证，直接查上游：PAT 是否有效、是否有该仓库权限 |
 | 私有镜像 401（已 docker login） | 登录链要求实例可直达上游 token 服务 | 检查上游 registry 与其 token 服务连通性；确认 realm 指向本实例 `/cr/<仓库>/v2/auth` |
+| 对外实例被滥用 | 实例无鉴权（与官方一致）且暴露公网 | 反代 basic auth / 防火墙限网段，见[鉴权与凭证透传](#鉴权与凭证透传) |
 | `400` 提示路径非法 | URL 含 `..` 穿越或控制字符 | 属预期防护，检查拼接逻辑 |
 | `405 Method not allowed` | 非协议请求用了白名单外方法（如 npm publish 的 `PUT`） | `ALLOWED_METHODS=GET,HEAD,PUT,POST` |
 | `414` | URL 超过 `MAX_PATH_LENGTH` | 调大或缩短路径 |
@@ -741,8 +765,8 @@ docker run -d --name xget ... xget-go:新版本
 
 ## 安全加固清单
 
-- [ ] **设置 `ACCESS_TOKEN`**（`openssl rand -hex 32`），或用防火墙/安全组限制访问源 —— 官方 README 明确建议实例必须置于鉴权或白名单之后
-- [ ] **全程 HTTPS**：Caddy 自动证书或 Nginx + certbot；纯 HTTP 会明文暴露 token
+- [ ] **对外防护**：本服务无内置鉴权（与官方一致）——公网实例套反代 basic auth，或防火墙/安全组限可信网段（官方 README 同样建议自部署实例置于鉴权或白名单之后）
+- [ ] **全程 HTTPS**：Caddy 自动证书或 Nginx + certbot；纯 HTTP 会明文暴露透传的上游凭证（PAT、API key）
 - [ ] **后端端口不暴露公网**：`-p 127.0.0.1:8080:8080` / `ufw deny 8080`
 - [ ] **收紧 CORS**：`ALLOWED_ORIGINS=https://your-app.example.com`（默认 `*`）
 - [ ] **启用 systemd 加固**：仓库 unit 已含 `DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`，请勿移除
@@ -757,7 +781,7 @@ internal/config/             环境变量解析（对应原版 src/config/index.
 internal/platform/           平台目录 + 最长前缀路由 + 路径改写
                              （platform-catalog / routing；crates 的 /api/v1 改写、
                               Docker registry 路径归一化 protocols/docker.js）
-internal/proxy/              请求管线：协议检测(Git/LFS/Docker) → 鉴权 → 校验 →
+internal/proxy/              请求管线：协议检测(Git/LFS/Docker) → 校验 →
                              重试转发 → HEAD 探测 → 响应终结
                              （handle-request / fetch-upstream / validation.js）
 internal/security/           安全头、CORS、JSON 错误契约（utils/security.js）
@@ -769,7 +793,7 @@ Dockerfile + .dockerignore   多阶段镜像构建（golang:1.23 编译 → alpi
 请求管线（一次代理的完整路径）：
 
 ```
-healthz? → token 鉴权 → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
+healthz? → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 → Docker /v2 探针 → 裸前缀 302 → 校验(穿越/长度/方法) → 平台最长前缀匹配
 → 路径改写(crates、/v2/cr 归一化) → 缓存查询 → 上游转发(重试+线性退避)
 → 响应终结(错误包装/文本改写/跳段头剥离/分级Cache-Control/安全头/性能头)
@@ -778,7 +802,7 @@ healthz? → token 鉴权 → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 
 ## 实测覆盖场景
 
-v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、token 鉴权、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿：
+v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿；v3.0.0 鉴权对齐改造后复验（无门禁、凭证透传、git/docker 链路、缓存行为不变）：
 
 - `git clone` / `ls-remote`（GitHub）、Git 协议 header 透传
 - GitHub release 下载（HEAD Content-Length 探测回填）、`Range` → `206` 断点续传
@@ -789,7 +813,7 @@ v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例�
 - **内容改写**：PyPI HTML → `/pypi/files/`、npm JSON → `/npm/`、flathub `.flatpakrepo` → `/flathub/repo/`（上游直链零残留）
 - **新平台**：debian/arch/cran/apache/aosp 可达；fedora `/pub/fedora/linux` 前缀剥离与直路径双形态 200
 - 路径穿越 `..` → `400`；方法白名单外 → `405`
-- token 鉴权三通道：缺 token `401`、错误 token `401`、`X-Xget-Token`/query 各 `200`、`/healthz` 免鉴权
+- 凭证透传（v3.0.0）：带任意 `Authorization` 的请求不再 401，原样到达上游（GitHub 对无效 PAT 返回其自身的 401 语义）；`/healthz` 恒 200
 
 ## 路线图
 

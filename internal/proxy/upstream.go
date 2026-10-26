@@ -38,7 +38,6 @@ var hopRequestHeaders = map[string]bool{
 	"transfer-encoding": true,
 	"te":                true,
 	"trailer":           true,
-	"x-xget-token":      true,
 }
 
 // response hop-by-hop headers that are never copied back to the client.

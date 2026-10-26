@@ -2,9 +2,10 @@
 #
 # Build:  docker build -t xget-go .
 # Run:    docker run -d -p 127.0.0.1:8080:8080 \
-#           -e ACCESS_TOKEN=$(openssl rand -hex 32) \
 #           -v xget-cache:/var/cache/xget \
 #           --restart unless-stopped --name xget xget-go
+# Note: no built-in auth (same as the official Xget) — bind to loopback and
+# put a reverse proxy with auth in front, or firewall the port.
 #
 # Stage 1 compiles the static binary inside golang:1.23-alpine (zero
 # third-party dependencies, so no module downloads are needed); stage 2

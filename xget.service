@@ -22,8 +22,8 @@ Environment=PORT=8080
 Environment=CACHE_DIR=/var/lib/xget/cache
 Environment=CACHE_MAX_MB=1024
 Environment=CACHE_MAX_FILE_MB=512
-# Set a token! Leaving it empty exposes an open proxy instance.
-#Environment=ACCESS_TOKEN=change-me-to-a-long-random-string
+# No built-in auth (same as the official Xget): keep this port behind a
+# reverse proxy with auth or firewalled to trusted networks.
 Environment=TIMEOUT_SECONDS=30
 Environment=MAX_RETRIES=3
 Environment=RETRY_DELAY_MS=1000

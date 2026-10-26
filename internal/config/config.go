@@ -13,7 +13,6 @@ import (
 // the original Cloudflare Workers implementation (src/config/index.js).
 type Config struct {
 	Port          string // PORT
-	AccessToken   string // ACCESS_TOKEN (empty = auth disabled)
 	HomepageURL   string // HOMEPAGE_URL (redirect target for / and unknown prefixes)
 	TimeoutSecond int    // TIMEOUT_SECONDS (per attempt, until response headers)
 	MaxRetries    int    // MAX_RETRIES
@@ -70,7 +69,6 @@ func FromEnv() *Config {
 	cacheDir := envDefault("CACHE_DIR", "cache")
 	return &Config{
 		Port:          envDefault("PORT", "8080"),
-		AccessToken:   os.Getenv("ACCESS_TOKEN"),
 		HomepageURL:   envDefault("HOMEPAGE_URL", "https://github.com/xixu-me/Xget"),
 		TimeoutSecond: envInt("TIMEOUT_SECONDS", 30, 1),
 		MaxRetries:    envInt("MAX_RETRIES", 3, 1),

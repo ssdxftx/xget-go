@@ -2,16 +2,17 @@
 // src/routing/resolve-target.js and src/response/finalize-response.js of the
 // original project.
 //
-// Flow: health → token auth → protocol traits → CORS preflight → docker API
-// probe → homepage redirect → validation → path normalization → platform
-// routing → upstream fetch with retries → response finalization.
+// Flow: health → protocol traits → CORS preflight → docker API probe →
+// homepage redirect → validation → path normalization → platform routing →
+// upstream fetch with retries → response finalization. Auth parity with the
+// original: no instance-level token gate — Authorization (and every other
+// credential header) is forwarded to the upstream untouched.
 //
 // Xget-Go - a single-binary port of xixu-me/Xget (AGPL-3.0-or-later).
 package proxy
 
 import (
 	"bytes"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,53 +72,6 @@ func normalizeDockerPath(path string) (string, int, string) {
 	return effective, 0, ""
 }
 
-// stripXgetToken removes the proxy-auth query parameter before the query is
-// forwarded upstream (it must not leak the instance token).
-func stripXgetToken(rawQuery string) string {
-	if rawQuery == "" {
-		return ""
-	}
-	parts := strings.Split(rawQuery, "&")
-	kept := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p == "" || strings.HasPrefix(p, "xget_token=") {
-			continue
-		}
-		kept = append(kept, p)
-	}
-	return strings.Join(kept, "&")
-}
-
-// authorized checks the instance access token when one is configured.
-// Accepted sources (first match wins):
-//  1. X-Xget-Token header          (leaves Authorization free for upstream)
-//  2. xget_token query parameter
-//  3. Authorization: Bearer <token> (consumed; NOT forwarded upstream)
-//
-// Returns ok=true when auth is disabled or the token matches, and whether an
-// Authorization header remains that should be forwarded upstream.
-func authorized(r *http.Request, cfg *config.Config) (ok, forwardAuth bool) {
-	token := cfg.AccessToken
-	if token == "" {
-		return true, r.Header.Get("Authorization") != ""
-	}
-	if t := r.Header.Get("X-Xget-Token"); t != "" {
-		return subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1, r.Header.Get("Authorization") != ""
-	}
-	if t := r.URL.Query().Get("xget_token"); t != "" {
-		return subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1, r.Header.Get("Authorization") != ""
-	}
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		const prefix = "Bearer "
-		if strings.HasPrefix(auth, prefix) {
-			t := strings.TrimSpace(auth[len(prefix):])
-			return subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1, false
-		}
-		return false, false
-	}
-	return false, false
-}
-
 // methodAllowed lists the effective methods for this request shape.
 func (h *Handler) methodAllowed(traits Traits) []string {
 	if traits.IsProtocol() {
@@ -156,13 +110,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.methodAllowed(tr))
 		h.emitMetrics(w, r, tr, "", start, 0, 0, "none")
 		http.Redirect(w, r, target, http.StatusFound)
-	}
-
-	// Instance access control (official README strongly recommends auth).
-	if ok, _ := authorized(r, h.cfg); !ok {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="xget"`)
-		localError(traits, "Unauthorized: missing or invalid access token", http.StatusUnauthorized)
-		return
 	}
 
 	// CORS preflight.
@@ -254,18 +201,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetURL := platform.Catalog[key] + transformed
-	if q := stripXgetToken(r.URL.RawQuery); q != "" {
+	if q := r.URL.RawQuery; q != "" {
 		targetURL += "?" + q
 	}
 
-	// Authorization forwarding: when the instance token came via
-	// X-Xget-Token/xget_token, a client Authorization header passes straight
-	// through to the upstream (private repo downloads). When Bearer was used
-	// for instance auth, upstream auth is intentionally not forwarded.
-	_, forwardAuth := authorized(r, h.cfg)
-	if !forwardAuth {
-		r.Header.Del("Authorization")
-	}
+	// Authorization is forwarded to the upstream as-is (parity with the
+	// original createFetchOptions): it carries UPSTREAM credentials (GitHub
+	// PAT, HF token, registry basic auth), never an instance token — this
+	// proxy has none.
 
 	// Protocol requests (git/LFS/docker/AI/HF) and non-GET/HEAD pass headers raw.
 	passthrough := traits.IsProtocol() || (r.Method != http.MethodGet && r.Method != http.MethodHead)
@@ -380,7 +323,7 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 				transformed = platform.NormalizeRegistryApiPath(key2, transformed)
 			}
 			target := platform.Catalog[key2] + transformed
-			if q := stripXgetToken(r.URL.RawQuery); q != "" {
+			if q := r.URL.RawQuery; q != "" {
 				target += "?" + q
 			}
 			hdr.Del("Content-Length")
