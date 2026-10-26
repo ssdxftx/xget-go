@@ -120,7 +120,10 @@ type Entry struct {
 	Base   string // upstream base URL
 }
 
-var sortedEntries = func() []Entry {
+// buildIndex materializes the routing table from Catalog: longest prefix
+// first so that "/pypi/files/..." resolves to "pypi-files" instead of
+// "pypi" (mirrors SORTED_PLATFORMS upstream).
+func buildIndex() []Entry {
 	out := make([]Entry, 0, len(Catalog))
 	for k, base := range Catalog {
 		out = append(out, Entry{
@@ -129,8 +132,6 @@ var sortedEntries = func() []Entry {
 			Base:   base,
 		})
 	}
-	// Longest prefix first so that "/pypi/files/..." resolves to
-	// "pypi-files" instead of "pypi" (mirrors SORTED_PLATFORMS upstream).
 	sort.Slice(out, func(i, j int) bool {
 		if len(out[i].Prefix) != len(out[j].Prefix) {
 			return len(out[i].Prefix) > len(out[j].Prefix)
@@ -138,7 +139,14 @@ var sortedEntries = func() []Entry {
 		return out[i].Key < out[j].Key
 	})
 	return out
-}()
+}
+
+var sortedEntries = buildIndex()
+
+// RefreshIndex rebuilds the routing table from the current Catalog. The
+// production catalog is static, so this only matters for tests that swap
+// platform base URLs at runtime.
+func RefreshIndex() { sortedEntries = buildIndex() }
 
 // All returns routing entries sorted by longest prefix first.
 func All() []Entry { return sortedEntries }

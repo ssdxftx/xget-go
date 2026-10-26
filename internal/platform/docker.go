@@ -1,7 +1,7 @@
 // Docker/OCI registry helpers ported from src/protocols/docker.js of the
-// original project (path normalization, scope extraction, token challenge
-// parsing). The full /v2/auth login proxy is out of scope for the standard
-// edition; anonymous token retry keeps public-image pulls working.
+// original project: WWW-Authenticate challenge parsing, token-service URL
+// construction, scope extraction and registry path normalization. The
+// /v2/auth login proxy itself lives in internal/proxy/docker-auth.go.
 //
 // Xget-Go - a single-binary port of xixu-me/Xget (AGPL-3.0-or-later).
 package platform

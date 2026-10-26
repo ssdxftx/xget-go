@@ -113,7 +113,7 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 			}
 		}
 		security.AddSecurityHeaders(hdr)
-		security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.methodAllowed(traits))
+		security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
 		w.WriteHeader(resp.StatusCode)
 		if r.Method != http.MethodHead && resp.Body != nil {
 			_, _ = io.Copy(w, resp.Body)

@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -41,11 +42,21 @@ func hasVersionLikeToken(value string) bool {
 	return reVersionLikeTail.MatchString(v)
 }
 
+// decodeBestEffort mirrors the best-effort decodeURIComponent the original
+// applies to basenames and release tags (falls back to the raw value on
+// malformed escapes).
+func decodeBestEffort(s string) string {
+	if d, err := url.PathUnescape(s); err == nil {
+		return d
+	}
+	return s
+}
+
 func lastSegment(path string) string {
 	parts := strings.Split(path, "/")
 	for i := len(parts) - 1; i >= 0; i-- {
 		if parts[i] != "" {
-			return parts[i]
+			return decodeBestEffort(parts[i])
 		}
 	}
 	return ""
@@ -62,7 +73,7 @@ func getGithubReleaseTag(path string) string {
 	for i, seg := range filtered {
 		if seg == "releases" && i+1 < len(filtered) && filtered[i+1] == "download" {
 			if i+2 < len(filtered) {
-				return filtered[i+2]
+				return decodeBestEffort(filtered[i+2])
 			}
 			return ""
 		}

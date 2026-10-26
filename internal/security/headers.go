@@ -55,7 +55,24 @@ func AddCorsHeaders(h http.Header, r *http.Request, allowedOrigins, allowedMetho
 	if reqHdrs := r.Header.Get("Access-Control-Request-Headers"); reqHdrs != "" {
 		h.Set("Access-Control-Allow-Headers", reqHdrs)
 	}
-	h.Add("Vary", "Origin")
+	// Merge Origin into any existing Vary values (deduplicated), mirroring
+	// the set-based merge of the original addCorsHeaders.
+	seen := map[string]bool{}
+	order := make([]string, 0, 4)
+	for _, v := range h.Values("Vary") {
+		for _, part := range strings.Split(v, ",") {
+			p := strings.TrimSpace(part)
+			if p == "" || seen[p] {
+				continue
+			}
+			seen[p] = true
+			order = append(order, p)
+		}
+	}
+	if !seen["Origin"] {
+		order = append(order, "Origin")
+	}
+	h.Set("Vary", strings.Join(order, ", "))
 	return true
 }
 

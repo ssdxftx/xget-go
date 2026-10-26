@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,30 @@ import (
 	"xget/internal/platform"
 	"xget/internal/security"
 )
+
+// statusWriter remembers whether the response status has been written so the
+// panic-recovery path knows if a 500 JSON contract can still be emitted.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	if !sw.wrote {
+		sw.status = code
+		sw.wrote = true
+	}
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Write(p []byte) (int, error) {
+	if !sw.wrote {
+		sw.status = http.StatusOK
+		sw.wrote = true
+	}
+	return sw.ResponseWriter.Write(p)
+}
 
 // Handler serves the accelerated proxy.
 type Handler struct {
@@ -82,12 +107,24 @@ func (h *Handler) methodAllowed(traits Traits) []string {
 
 // ServeHTTP implements the full request pipeline.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Track write state so a recovered panic can still emit the same 500
+	// JSON contract the original produces via its top-level try/catch.
+	sw := &statusWriter{ResponseWriter: w}
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("panic recovered: %v\n%s", rec, debug.Stack())
+			if !sw.wrote {
+				security.WriteError(sw, r, "Internal Server Error", http.StatusInternalServerError, true)
+			}
+		}
+	}()
+
 	start := time.Now()
 
 	// Liveness probe is always open.
 	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok"))
+		sw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = sw.Write([]byte("ok"))
 		return
 	}
 
@@ -97,19 +134,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Locally generated responses all carry the header set the original
 	// project applies globally in handleRequest: security headers, CORS
-	// (when an Origin is present) and, for non-protocol requests, the
-	// performance header.
+	// (when an Origin is present, advertising the CONFIGURED method list —
+	// only the preflight handler widens it) and, for non-protocol requests,
+	// the performance header.
 	localError := func(tr Traits, msg string, status int) {
-		security.AddSecurityHeaders(w.Header())
-		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.methodAllowed(tr))
-		h.emitMetrics(w, r, tr, "", start, 0, 0, "none")
-		security.WriteError(w, r, msg, status, false)
+		security.AddSecurityHeaders(sw.Header())
+		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+		h.emitMetrics(sw, r, tr, "", start, 0, 0, "none")
+		security.WriteError(sw, r, msg, status, false)
 	}
+	// Homepage redirect mirrors Response.redirect: Location + 302, empty body.
 	localRedirect := func(tr Traits, target string) {
-		security.AddSecurityHeaders(w.Header())
-		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.methodAllowed(tr))
-		h.emitMetrics(w, r, tr, "", start, 0, 0, "none")
-		http.Redirect(w, r, target, http.StatusFound)
+		security.AddSecurityHeaders(sw.Header())
+		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+		h.emitMetrics(sw, r, tr, "", start, 0, 0, "none")
+		sw.Header().Set("Location", target)
+		sw.WriteHeader(http.StatusFound)
 	}
 
 	// CORS preflight.
@@ -122,32 +162,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		hdr := http.Header{}
-		if !security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, allowed) {
+		if !security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods) {
 			localError(traits, "Origin not allowed", http.StatusForbidden)
 			return
 		}
+		// The preflight handler is the ONLY place the widened protocol
+		// method list is advertised (mirrors the official override).
 		hdr.Set("Access-Control-Allow-Methods", joinMethods(allowed))
 		hdr.Set("Access-Control-Max-Age", "86400")
 		security.AddSecurityHeaders(hdr)
 		for k, vv := range hdr {
 			for _, val := range vv {
-				w.Header().Add(k, val)
+				sw.Header().Add(k, val)
 			}
 		}
-		h.emitMetrics(w, r, traits, "", start, 0, 0, "none")
-		w.WriteHeader(http.StatusNoContent)
+		h.emitMetrics(sw, r, traits, "", start, 0, 0, "none")
+		sw.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	// Docker registry API version probe.
 	if traits.Docker && (path == "/v2" || path == "/v2/") {
-		w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
-		w.Header().Set("Content-Type", "application/json")
-		security.AddSecurityHeaders(w.Header())
-		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.methodAllowed(traits))
-		w.WriteHeader(http.StatusOK)
+		sw.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+		sw.Header().Set("Content-Type", "application/json")
+		security.AddSecurityHeaders(sw.Header())
+		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+		sw.WriteHeader(http.StatusOK)
 		if r.Method != http.MethodHead {
-			_, _ = w.Write([]byte("{}"))
+			_, _ = sw.Write([]byte("{}"))
 		}
 		return
 	}
@@ -177,7 +219,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The /v2/auth login proxy negotiates registry credentials
 		// for private repositories (full docker login chain).
 		if path == "/v2/auth" || regexpMustMatch(`/^\/cr\/[^/]+\/v2\/auth\/?$/`)(path) {
-			h.handleDockerAuth(w, r, path, traits, localError)
+			h.handleDockerAuth(sw, r, path, traits, localError)
 			log.Printf("%s %s%s → docker-auth", clientIP(r), r.Method, r.URL.RequestURI())
 			return
 		}
@@ -235,9 +277,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheURL += sep + "__xget_origin=" + url.QueryEscape(requestOrigin(r))
 	}
 
-	if policy.Cacheable {
+	// Cache lookup: GET only — the original's allowCacheApi is GET-only,
+	// so HEAD always fetches fresh from the upstream (port of
+	// tryReadCachedResponse: protocol requests, sensitive headers and
+	// non-GET/HEAD never touch the cache).
+	if policy.Cacheable && r.Method == http.MethodGet {
 		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
-			h.serveFromCache(w, r, entry, key, start)
+			h.serveFromCache(sw, r, entry, key, start)
 			log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
 				clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
 			return
@@ -246,7 +292,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cacheStatus := string(policy.Mode) // edge→edge / bypass / private
 
 	up := h.fetchUpstream(r, v, targetURL, traits, passthrough, key, effectivePath)
-	h.finalize(w, r, up, v, traits, passthrough, key, effectivePath, targetURL, cacheURL, policy, cacheStatus, start)
+	h.finalize(sw, r, up, v, traits, passthrough, key, effectivePath, targetURL, cacheURL, policy, cacheStatus, start)
 
 	log.Printf("%s %s%s → %s [%s] status=%d attempts=%d fetch_ms=%.1f total_ms=%.1f cache=%s",
 		clientIP(r), r.Method, r.URL.RequestURI(), targetURL, keyOrDash(key),
@@ -269,7 +315,9 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	}()
 
 	// Error wrapping: standard requests get the JSON contract; docker 401s
-	// without a challenge hint at private repositories. Git/LFS/AI/HF
+	// without a challenge hint at private repositories — unless the registry
+	// already answered with its own JSON UNAUTHORIZED error (official
+	// isCustomError branch), which passes through untouched. Git/LFS/AI/HF
 	// errors pass through untouched.
 	if !up.local && resp.StatusCode >= 400 {
 		switch {
@@ -283,10 +331,16 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		case traits.Docker && resp.StatusCode == http.StatusUnauthorized && resp.Header.Get("WWW-Authenticate") == "":
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
-			resp = security.BuildErrorResponse(
-				fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
-				resp.StatusCode, true)
-			up.local = true
+			if resp.Header.Get("Content-Type") == "application/json" &&
+				strings.Contains(string(body), "UNAUTHORIZED") {
+				// Registry's own JSON error: relay as-is.
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+			} else {
+				resp = security.BuildErrorResponse(
+					fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
+					resp.StatusCode, true)
+				up.local = true
+			}
 		}
 	}
 
@@ -334,10 +388,12 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	}
 
 	// Text rewriting keeps follow-up requests flowing through this
-	// instance (port of the finalizeSuccessfulResponse rewriters).
+	// instance (port of the finalizeSuccessfulResponse rewriters, which
+	// run for every ok (2xx) response).
 	var bodySrc io.Reader = resp.Body
 	originBoundRewrite := false
-	if !traits.IsProtocol() && r.Method == http.MethodGet && resp.StatusCode == http.StatusOK &&
+	if !traits.IsProtocol() && r.Method == http.MethodGet &&
+		resp.StatusCode >= 200 && resp.StatusCode < 300 &&
 		shouldRewriteTextResponse(key, effectivePath, resp.Header.Get("Content-Type")) {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, rewriteMaxBytes+1))
 		if len(raw) <= rewriteMaxBytes {
@@ -351,37 +407,34 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		}
 	}
 
-	// Cache-policy headers + disk-cache write (port of the response-aware
-	// resolveCachePolicy + background cache.put). A pypi rewrite binds the
+	// Cache-policy headers + disk-cache write (port of finalizeSuccessfulResponse:
+	// the whole block only runs for ok responses). A pypi rewrite binds the
 	// body to this instance's origin, so the policy downgrades to bypass
 	// (hasOriginBoundRewrite upstream).
-	if originBoundRewrite {
-		policy = CachePolicy{Mode: CacheBypass, NoStore: true}
-		cacheStatus = string(policy.Mode)
-	}
 	var cacheWriter *cache.Writer
-	if !traits.IsProtocol() {
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
-			respPolicy := resolveResponseCachePolicy(policy, resp.Header)
-			hdr.Set("Cache-Control", respPolicy.CacheControlValue())
-			if respPolicy.PrivateOnly {
-				if vary := hdr.Get("Vary"); vary != "" {
-					hdr.Set("Vary", vary+", Authorization, Cookie")
-				} else {
-					hdr.Set("Vary", "Authorization, Cookie")
-				}
+	if !traits.IsProtocol() && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if originBoundRewrite {
+			policy = CachePolicy{Mode: CacheBypass, NoStore: true}
+			cacheStatus = string(policy.Mode)
+		}
+		respPolicy := resolveResponseCachePolicy(policy, resp.Header)
+		hdr.Set("Cache-Control", respPolicy.CacheControlValue())
+		if respPolicy.PrivateOnly {
+			if vary := hdr.Get("Vary"); vary != "" {
+				hdr.Set("Vary", vary+", Authorization, Cookie")
+			} else {
+				hdr.Set("Vary", "Authorization, Cookie")
 			}
-			if resp.StatusCode == http.StatusOK && r.Method == http.MethodGet && respPolicy.Cacheable {
-				cacheWriter = h.store.Begin(cache.Key(cacheURL), resp.StatusCode, hdr, respPolicy.EdgeTTL)
-			}
+		}
+		if resp.StatusCode == http.StatusOK && r.Method == http.MethodGet && respPolicy.Cacheable {
+			cacheWriter = h.store.Begin(cache.Key(cacheURL), resp.StatusCode, hdr, respPolicy.EdgeTTL)
 		}
 		hdr.Set("X-Content-Type-Options", "nosniff")
 		hdr.Set("Accept-Ranges", "bytes")
 		security.AddSecurityHeaders(hdr)
 	}
 
-	allowed := h.methodAllowed(traits)
-	security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, allowed)
+	security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
 	h.emitMetrics(w, r, traits, key, start, up.fetchMs, up.attempts, cacheStatus)
 
 	w.WriteHeader(resp.StatusCode)

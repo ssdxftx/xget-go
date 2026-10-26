@@ -58,7 +58,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 ## 与官方版的差异
 
-v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
+v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。v3.0.1 以官方源码为基准完成第二轮全量审查（84 个平台目录逐项 diff + 请求管线/校验/协议/上游/缓存/改写/响应头逐模块比对，另附 8 项 mock 上游回归测试），修复 12 处偏差：可重试状态耗尽后返回最后一个上游响应（此前 304/5xx 耗尽会错误地得到合成 500，影响带 If-None-Match 的 docker manifest 条件请求）、Docker 匿名 token 重试保留原请求方法、token 服务响应接受任意 2xx、HEAD 不再读磁盘缓存（官方缓存读写均为 GET-only）、非预检响应的 Access-Control-Allow-Methods 恒为配置白名单（此前协议响应误用扩展表）、registry 自带 JSON UNAUTHORIZED 错误原样透传、主页 302 空响应体、nosniff/Accept-Ranges/Cache-Control 仅作用于 2xx、GET/HEAD 请求体不再转发上游、缓存键 basename/release tag 百分号解码、CORS Vary 合并去重、registry 重定向跟随失败并入重试链。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
@@ -190,7 +190,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v3.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+./build.sh v3.0.1        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
 
 # 前台试用（默认 8080 端口 —— 仅限内网/本机！）
@@ -267,7 +267,7 @@ PORT=8080 xget-go
 启动日志示例：
 
 ```
-xget-go v3.0.0 starting — port=8080 retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
+xget-go v3.0.1 starting — port=8080 retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
 auth: none (parity with the official Xget) — expose via a reverse proxy with auth or a firewall/allowlist if the instance must not be public
 listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```
@@ -281,7 +281,7 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
-xget-go --version        # → xget-go v3.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
+xget-go --version        # → xget-go v3.0.1 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
 ```
 
@@ -343,12 +343,12 @@ journalctl -u xget --since today   # 今日日志
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-docker build -t xget-go:3.0.0 .
+docker build -t xget-go:3.0.1 .
 
 docker run -d --name xget \
   -p 127.0.0.1:8080:8080 \
   --restart unless-stopped \
-  xget-go:3.0.0
+  xget-go:3.0.1
 
 # 验证
 curl http://127.0.0.1:8080/healthz    # → ok
@@ -363,7 +363,7 @@ docker logs -f xget                   # 查看日志
 services:
   xget:
     build: .
-    image: xget-go:3.0.0
+    image: xget-go:3.0.1
     ports:
       - "127.0.0.1:8080:8080"
     restart: unless-stopped
@@ -802,7 +802,7 @@ healthz? → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 
 ## 实测覆盖场景
 
-v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿；v3.0.0 鉴权对齐改造后复验（无门禁、凭证透传、git/docker 链路、缓存行为不变）：
+v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿；v3.0.0 鉴权对齐改造后复验（无门禁、凭证透传、git/docker 链路、缓存行为不变）：v3.0.1 二轮审查后以 8 项 mock 上游回归（重试耗尽返回最后上游响应、304 条件透传、匿名重试保留 PUT 方法与 2xx token、HEAD 不读缓存、配置化 ACA-M、302 空体、registry JSON 401 透传、GET 不转发请求体）加 12 项真实上游冒烟复验全绿：
 
 - `git clone` / `ls-remote`（GitHub）、Git 协议 header 透传
 - GitHub release 下载（HEAD Content-Length 探测回填）、`Range` → `206` 断点续传

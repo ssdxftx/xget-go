@@ -105,12 +105,13 @@ func (b *bodyProvider) replayable() bool { return b == nil || b.buf != nil || b.
 
 // captureBody buffers small incoming bodies for replay, or switches to
 // single-shot streaming for oversized ones (re-aggregating the probe bytes
-// so the stream is not truncated).
+// so the stream is not truncated). GET/HEAD never carry an upstream body,
+// mirroring createFetchOptions (body attached only when !canUseCache).
 func captureBody(r *http.Request) (*bodyProvider, error) {
-	if r.Body == nil || r.Body == http.NoBody {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return nil, nil
 	}
-	if r.ContentLength == 0 && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
 	buf, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBuffer+1))
@@ -276,12 +277,15 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 			if in.Context().Err() != nil {
 				return localTextResult(in.Context(), "Client disconnected", http.StatusBadGateway)
 			}
-			// Transport-level failure → backoff and retry.
+			// Transport-level failure → backoff and retry; a failure on
+			// the FINAL attempt collapses to the same 502 the original
+			// produces when its fetch throws after the last retry.
 			transportFailed = true
 			if attempt < maxAttempts-1 {
 				time.Sleep(time.Duration(h.cfg.RetryDelayMs*(attempt+1)) * time.Millisecond)
+				continue
 			}
-			continue
+			return localTextResult(in.Context(), "Upstream request failed", http.StatusBadGateway)
 		}
 
 		// Headers arrived in time; detach streaming from the timer.
@@ -296,7 +300,15 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		if traits.Docker {
 			var redirFailed bool
 			r, redirFailed = h.followDockerRedirect(r, baseHeaders, body)
-			transportFailed = transportFailed || redirFailed
+			if redirFailed {
+				// Same contract as a fetch exception while chasing a
+				// registry redirect: retry, then 502 on the final try.
+				if attempt < maxAttempts-1 {
+					time.Sleep(time.Duration(h.cfg.RetryDelayMs*(attempt+1)) * time.Millisecond)
+					continue
+				}
+				return localTextResult(in.Context(), "Upstream request failed", http.StatusBadGateway)
+			}
 		}
 
 		if (r.StatusCode >= 200 && r.StatusCode < 300) || r.StatusCode == http.StatusPartialContent {
@@ -314,12 +326,20 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 			break
 		}
 
-		// 5xx / unexpected: drain and retry.
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 64<<10))
-		r.Body.Close()
-		resp = nil
+		// Retryable status (3xx, 5xx, unexpected): keep the last
+		// response — the original returns the final upstream response
+		// once retries are exhausted (a 304 must still reach
+		// conditional clients; a 5xx feeds the error-wrap contract).
+		// On non-final attempts the body is drained and closed before
+		// the next try; on the final attempt it stays intact for
+		// finalize.
 		if attempt < maxAttempts-1 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 64<<10))
+			r.Body.Close()
+			resp = r
 			time.Sleep(time.Duration(h.cfg.RetryDelayMs*(attempt+1)) * time.Millisecond)
+		} else {
+			resp = r
 		}
 	}
 
@@ -359,11 +379,11 @@ func redirectStatus(code int) bool {
 // followDockerRedirect re-issues a registry redirect without forwarding
 // credentials (port of followDockerRedirectIfNeeded). Chained redirects are
 // resolved by the standard client; only GET/HEAD are re-issued bodyless,
-// which covers every registry blob/manifest flow.
+// which covers every registry blob/manifest flow. The second return value
+// reports a transport-level failure while chasing the redirect so the retry
+// loop can classify exhaustion as a 502 — the contract the original gets
+// via fetch exceptions.
 func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool) {
-	// The second return value reports a transport-level failure while
-	// chasing the redirect, so the retry loop can classify exhaustion as
-	// a 502 - the contract the original gets via fetch exceptions.
 	if !redirectStatus(resp.StatusCode) {
 		return resp, false
 	}
@@ -383,7 +403,7 @@ func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header,
 	bodyRc, _ := body.get()
 	req, err := http.NewRequestWithContext(resp.Request.Context(), resp.Request.Method, next.String(), bodyRc)
 	if err != nil {
-		return security.BuildErrorResponse("Bad registry redirect", http.StatusBadGateway, false), true
+		return nil, true
 	}
 	if bodyRc != nil && body != nil && body.buf != nil {
 		req.ContentLength = int64(len(body.buf))
@@ -392,7 +412,7 @@ func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header,
 
 	followed, err := h.client.Do(req) // default client: follows chains
 	if err != nil {
-		return security.BuildErrorResponse("Registry redirect failed", http.StatusBadGateway, false), true
+		return nil, true
 	}
 	return followed, false
 }
@@ -429,8 +449,8 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 		return deny()
 	}
 	defer tres.Body.Close()
-	if tres.StatusCode != http.StatusOK {
-		return deny()
+	if tres.StatusCode < 200 || tres.StatusCode >= 300 {
+		return deny() // official: tokenResponse.ok — any 2xx
 	}
 	token := readRegistryToken(tres.Body)
 	if token == "" {
@@ -440,7 +460,9 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 	hdr := headers.Clone()
 	hdr.Set("Authorization", "Bearer "+token)
 	bodyRc, _ := body.get()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, bodyRc)
+	// Keep the ORIGINAL method and any buffered body (official spreads
+	// the original fetch options into the retry).
+	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bodyRc)
 	if err != nil {
 		return deny()
 	}
