@@ -1,6 +1,7 @@
-# Keep the Docker build context minimal: only runtime assets are needed.
+# Keep the build context minimal: the builder stage only needs the Go source.
 *
-!xget-linux-amd64
-!xget-linux-arm64
+!go.mod
+!main.go
+!internal/
 !Dockerfile
 !LICENSE

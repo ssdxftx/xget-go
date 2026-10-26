@@ -20,7 +20,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 - [与官方版的差异](#与官方版的差异)
 - [支持的平台前缀](#支持的平台前缀)
 - [快速开始](#快速开始)
-- [部署教程](#部署教程)（systemd / Docker / 源码 / 反向代理 / HTTPS）
+- [部署教程](#部署教程)（源码构建 / systemd / Docker / 反向代理 / HTTPS）
 - [配置参考](#配置参考)
 - [鉴权详解](#鉴权详解)
 - [使用示例](#使用示例)
@@ -122,14 +122,19 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 ## 快速开始
 
-从发布包 `xget-go-v1.0.0.zip` 中取出对应架构的二进制（`uname -m` 确认：`x86_64` → `xget-linux-amd64`，`aarch64` → `xget-linux-arm64`，Apple Silicon → `xget-darwin-arm64`）：
+从 GitHub 仓库克隆源码并构建（**Go 1.23+**，零第三方依赖，纯标准库；三平台二进制约 6 MB）：
 
 ```bash
+git clone https://github.com/ssdxftx/xget-go.git
+cd xget-go
+./build.sh v1.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
+
 # 前台试用（默认 8080 端口、无鉴权 —— 仅限内网/本机！）
-./xget-linux-amd64
+xget-go
 
 # 生产运行：务必设置 token
-PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" ./xget-linux-amd64
+PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
 ```
 
 启动后验证：
@@ -143,27 +148,57 @@ curl -sI "http://127.0.0.1:8080/gh/xixu-me/Xget" | head -5
 
 ## 部署教程
 
-本章覆盖四种部署方式与配套的网络配置。**推荐组合：systemd（或 Docker）+ Nginx/Caddy 反向代理 + HTTPS**。
+本章所有方式都从 GitHub 仓库出发，配套网络配置一并列出。**推荐组合：systemd（或 Docker）+ Nginx/Caddy 反向代理 + HTTPS**。
 
 | 方式 | 适用场景 | 难度 |
 |------|----------|------|
 | [前台运行](#方式一前台运行试用调试) | 快速试用、本地调试 | ★ |
 | [systemd 服务](#方式二systemd-生产部署推荐) | Linux 服务器长期运行 | ★★（推荐） |
-| [Docker](#方式三docker-部署) | 容器化环境、与其它服务统一编排 | ★★ |
-| [源码构建](#方式四从源码构建部署) | 自行修改代码、需要其它平台二进制 | ★★★ |
+| [Docker](#方式三docker-部署) | 容器化环境、与其它服务统一编排（无需本地 Go） | ★★ |
 
-### 前置要求
+### 第 0 步：获取源码并构建（各方式共同起点）
 
-- 一台可访问公网的服务器（xget-go 需要能连通各上游平台）
-- 对应架构的二进制：`x86_64` 用 `xget-linux-amd64`，`aarch64` 用 `xget-linux-arm64`
-- （可选）一个解析到服务器 IP 的域名 + `80/443` 端口，用于 HTTPS 反代
-- （方式四）Go 1.23+ 工具链
+**安装 Go 1.23+**（仅前台运行与 systemd 方式需要；Docker 方式在容器内编译，可跳过）：
+
+```bash
+# 方法 A：官方包（推荐，版本最新）
+wget https://go.dev/dl/go1.23.12.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.23.12.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin        # 写入 ~/.bashrc
+
+# 方法 B：发行版包管理器（版本可能偏旧，需确认 ≥1.23）
+sudo apt install golang-go
+```
+
+**克隆并构建**：
+
+```bash
+git clone https://github.com/ssdxftx/xget-go.git
+cd xget-go
+./build.sh v1.0.0                          # linux-amd64 / linux-arm64 / darwin-arm64
+# 或只构建当前平台：
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o xget-linux-amd64 .
+```
+
+需要其它平台时交叉编译（零依赖，装好 Go 即可）：
+
+| 目标平台 | 环境变量 |
+|----------|----------|
+| Linux x86_64 | `GOOS=linux GOARCH=amd64` |
+| Linux arm64 | `GOOS=linux GOARCH=arm64` |
+| macOS Apple Silicon | `GOOS=darwin GOARCH=arm64` |
+| macOS Intel | `GOOS=darwin GOARCH=amd64` |
+| FreeBSD | `GOOS=freebsd GOARCH=amd64` |
+| Windows | `GOOS=windows GOARCH=amd64`（产物为 `.exe`） |
+
+> 仓库按惯例不含预编译二进制（见 `.gitignore`），构建产物留在本机即可；后续升级执行 `git pull && ./build.sh` 重新构建覆盖。
 
 ### 方式一：前台运行（试用/调试）
 
+接[第 0 步](#第-0-步获取源码并构建各方式共同起点)构建产物：
+
 ```bash
-chmod +x xget-linux-amd64
-sudo mv xget-linux-amd64 /usr/local/bin/xget-go
+sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 
 PORT=8080 ACCESS_TOKEN="$(openssl rand -hex 24)" xget-go
 # Ctrl+C 停止
@@ -180,10 +215,10 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 
 ### 方式二：systemd 生产部署（推荐）
 
-**第 1 步：安装二进制**
+**第 1 步：安装二进制**（接第 0 步构建产物）
 
 ```bash
-sudo mv xget-linux-amd64 /usr/local/bin/xget-go
+sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
 xget-go --version        # → xget-go v1.0.0 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
@@ -197,7 +232,7 @@ sudo chmod 600 /etc/xget/xget.env
 # 可按需追加：PORT=8080、TIMEOUT_SECONDS=30 等，见《配置参考》
 ```
 
-**第 3 步：安装服务单元**（发布包内已提供 `xget.service`，含安全加固）
+**第 3 步：安装服务单元**（仓库根目录已提供 `xget.service`，含安全加固）
 
 ```bash
 sudo cp xget.service /etc/systemd/system/xget.service
@@ -208,11 +243,11 @@ sudo cp xget.service /etc/systemd/system/xget.service
 ```ini
 [Service]
 EnvironmentFile=/etc/xget/xget.env        # ← 新增这一行
-# 以下为发布包默认已含的加固项，无需改动：
+# 以下为仓库 unit 默认已含的加固项，无需改动：
 # DynamicUser=yes / NoNewPrivileges=yes / ProtectSystem=strict ...
 ```
 
-> 发布包默认 `ExecStart=/usr/local/bin/xget-go`、`Environment=PORT=8080`；`DynamicUser=yes` 会让服务以随机非特权用户运行。若需自定义端口等，直接在 unit 里加 `Environment=XXX=...` 或写进 `/etc/xget/xget.env`。
+> 仓库 unit 默认 `ExecStart=/usr/local/bin/xget-go`、`Environment=PORT=8080`；`DynamicUser=yes` 会让服务以随机非特权用户运行。若需自定义端口等，直接在 unit 里加 `Environment=XXX=...` 或写进 `/etc/xget/xget.env`。
 
 **第 4 步：启动并设置开机自启**
 
@@ -244,9 +279,10 @@ journalctl -u xget --since today   # 今日日志
 
 ### 方式三：Docker 部署
 
-发布包内含 `Dockerfile`（基于 `alpine:3.20` + ca-certificates，构建上下文只取对应架构的二进制）。
+仓库内含**多阶段构建**的 `Dockerfile`（`golang:1.23-alpine` 编译 → `alpine:3.20` 运行 + ca-certificates）。**全新 clone 直接构建即可，本机无需安装 Go**；x86_64/arm64 由 Go 在容器内原生产出对应架构二进制（多架构构建需 `docker buildx` + QEMU）：
 
 ```bash
+git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
 docker build -t xget-go:1.0.0 .
 
@@ -280,36 +316,6 @@ services:
       interval: 30s
       timeout: 3s
 ```
-
-arm64 服务器上 `docker build` 会经 BuildKit 的 `TARGETARCH` 自动选用 `xget-linux-arm64`（多架构构建需 `docker buildx` + QEMU）。
-
-### 方式四：从源码构建部署
-
-```bash
-git clone https://github.com/ssdxftx/xget-go.git && cd xget-go
-./build.sh v1.0.0        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
-# 或手动构建：
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o xget-linux-amd64 .
-```
-
-交叉编译任意平台（零依赖，装好 Go 即可）：
-
-| 目标平台 | 环境变量 |
-|----------|----------|
-| Linux x86_64 | `GOOS=linux GOARCH=amd64` |
-| Linux arm64 | `GOOS=linux GOARCH=arm64` |
-| macOS Apple Silicon | `GOOS=darwin GOARCH=arm64` |
-| macOS Intel | `GOOS=darwin GOARCH=amd64` |
-| FreeBSD | `GOOS=freebsd GOARCH=amd64` |
-| Windows | `GOOS=windows GOARCH=amd64`（产物为 `.exe`） |
-
-示例：
-
-```bash
-CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o xget-darwin-amd64 .
-```
-
-构建完成后按 [方式二](#方式二systemd-生产部署推荐) 或 [方式三](#方式三docker-部署) 部署即可。
 
 ### 反向代理与 HTTPS
 
@@ -639,7 +645,7 @@ docker run -d --name xget ... xget-go:新版本
 - [ ] **全程 HTTPS**：Caddy 自动证书或 Nginx + certbot；纯 HTTP 会明文暴露 token
 - [ ] **后端端口不暴露公网**：`-p 127.0.0.1:8080:8080` / `ufw deny 8080`
 - [ ] **收紧 CORS**：`ALLOWED_ORIGINS=https://your-app.example.com`（默认 `*`）
-- [ ] **启用 systemd 加固**：发布包 unit 已含 `DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`，请勿移除
+- [ ] **启用 systemd 加固**：仓库 unit 已含 `DynamicUser`、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`，请勿移除
 - [ ] **日志轮转**：journald 默认有上限；自管场景可 `logrotate` 或接入 Loki/ELK
 - [ ] **保持更新**：关注上游 Xget 的安全修复并同步移植
 
@@ -657,7 +663,7 @@ internal/proxy/              请求管线：协议检测(Git/LFS/Docker) → 鉴
 internal/security/           安全头、CORS、JSON 错误契约（utils/security.js）
 build.sh                     三平台静态构建脚本
 xget.service                 systemd 单元（含安全加固）
-Dockerfile + .dockerignore   Docker 镜像构建（alpine + ca-certificates）
+Dockerfile + .dockerignore   多阶段镜像构建（golang:1.23 编译 → alpine 运行）
 ```
 
 请求管线（一次代理的完整路径）：

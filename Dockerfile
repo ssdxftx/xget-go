@@ -1,21 +1,30 @@
-# Xget-Go — Docker image build.
-# Requires the prebuilt binaries from build.sh to be present in the build
-# context (xget-linux-amd64 / xget-linux-arm64). The correct one is picked
-# automatically via the TARGETARCH build arg supplied by BuildKit.
+# Xget-Go — multi-stage Docker build, works directly from a fresh clone.
 #
 # Build:  docker build -t xget-go .
-# Run:    docker run -d -p 8080:8080 \
-#           -e ACCESS_TOKEN=$(openssl rand -hex 24) \
+# Run:    docker run -d -p 127.0.0.1:8080:8080 \
+#           -e ACCESS_TOKEN=$(openssl rand -hex 32) \
 #           --restart unless-stopped --name xget xget-go
+#
+# Stage 1 compiles the static binary inside golang:1.23-alpine (zero
+# third-party dependencies, so no module downloads are needed); stage 2
+# produces a minimal runtime image with CA certificates for upstream HTTPS.
+# Buildx/QEMU handle cross-arch automatically: Go inside the container
+# targets the container platform natively.
+
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod main.go ./
+COPY internal ./internal
+ARG VERSION=docker
+RUN CGO_ENABLED=0 go build -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/xget-go .
 
 FROM alpine:3.20
-
 # CA certificates are mandatory: every upstream connection is HTTPS.
 RUN apk add --no-cache ca-certificates wget \
     && adduser -D -H -u 1000 xget
-
-ARG TARGETARCH=amd64
-COPY xget-linux-${TARGETARCH} /usr/local/bin/xget-go
+COPY --from=build /out/xget-go /usr/local/bin/xget-go
 RUN chmod 0755 /usr/local/bin/xget-go
 
 ENV PORT=8080
