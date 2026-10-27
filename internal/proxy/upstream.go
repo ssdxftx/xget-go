@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -221,7 +222,7 @@ func buildHeaders(in *http.Request, v *view, passthrough bool, targetURL string,
 // key/effectivePath come pre-resolved from the caller (docker paths are
 // normalized before routing, so resolving them here from the raw path
 // would yield no platform).
-func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, traits Traits, passthrough bool, key, effectivePath string) *upstreamResult {
+func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, traits Traits, passthrough bool, key, effectivePath string, mon *performanceMonitor) *upstreamResult {
 	start := time.Now()
 
 	body, err := captureBody(in)
@@ -247,6 +248,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		actualAttempts = attempt + 1
+		mon.mark("attempt_" + strconv.Itoa(attempt))
 		bodyRc, _ := body.get()
 		req, err := http.NewRequestWithContext(in.Context(), in.Method, targetURL, bodyRc)
 		if err != nil {
@@ -312,16 +314,22 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		}
 
 		if (r.StatusCode >= 200 && r.StatusCode < 300) || r.StatusCode == http.StatusPartialContent {
+			mon.mark("success")
 			resp = r
 			break
 		}
 
 		if traits.Docker && r.StatusCode == http.StatusUnauthorized {
+			mon.mark("docker_auth_challenge")
 			resp = h.dockerAnonymousRetry(in.Context(), targetURL, key, effectivePath, baseHeaders, body, r, in)
+			if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				mon.mark("success")
+			}
 			break
 		}
 
 		if r.StatusCode >= 400 && r.StatusCode < 500 {
+			mon.mark("client_error")
 			resp = r // client error: retrying will not help
 			break
 		}

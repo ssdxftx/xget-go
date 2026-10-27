@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"xget/internal/cache"
 	"xget/internal/security"
@@ -86,7 +85,7 @@ func parseSingleRange(spec string, size int64) (start, end int64, ok bool) {
 
 // serveFromCache writes a stored entry (full or 206 slice for GET Range,
 // headers-only for HEAD). mirrored from the Cloudflare cache.match flow.
-func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *cache.Entry, key string, start time.Time) {
+func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *cache.Entry, mon *performanceMonitor, hitMark string) {
 	hdr := w.Header()
 	for k, vv := range entry.Header {
 		if hopResponseHeaders[strings.ToLower(k)] {
@@ -100,7 +99,10 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	hdr.Set("Accept-Ranges", "bytes")
 	security.AddSecurityHeaders(hdr)
 	security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
-	h.emitMetrics(w, r, Traits{}, key, start, 0, 0, "hit")
+	if hitMark != "" {
+		mon.mark(hitMark)
+	}
+	h.emitMetrics(w, r, Traits{}, mon)
 
 	isHEAD := r.Method == http.MethodHead
 	body, bodyStart, err := entry.OpenBody()

@@ -13,12 +13,12 @@ package proxy
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"runtime/debug"
 	"strconv"
@@ -107,7 +107,8 @@ func (h *Handler) methodAllowed(traits Traits) []string {
 
 // ServeHTTP implements the full request pipeline.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
+	mon := newPerformanceMonitor()
+	start := mon.start
 
 	// Track write state so a recovered panic can still emit the same
 	// plain-text 500 the original produces via its top-level try/catch.
@@ -122,7 +123,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// createErrorResponse('Internal Server Error', 500)
 				// WITHOUT the JSON-details flag: a plain-text body.
 				security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
-				h.emitMetrics(sw, r, detected, "", start, 0, 0, "none")
+				h.emitMetrics(sw, r, detected, mon)
 				security.WriteError(sw, r, "Internal Server Error", http.StatusInternalServerError, false)
 			}
 		}
@@ -148,14 +149,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	localError := func(tr Traits, msg string, status int) {
 		security.AddSecurityHeaders(sw.Header())
 		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
-		h.emitMetrics(sw, r, tr, "", start, 0, 0, "none")
+		h.emitMetrics(sw, r, tr, mon)
 		security.WriteError(sw, r, msg, status, false)
 	}
 	// Homepage redirect mirrors Response.redirect: Location + 302, empty body.
 	localRedirect := func(tr Traits, target string) {
 		security.AddSecurityHeaders(sw.Header())
 		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
-		h.emitMetrics(sw, r, tr, "", start, 0, 0, "none")
+		h.emitMetrics(sw, r, tr, mon)
 		sw.Header().Set("Location", target)
 		sw.WriteHeader(http.StatusFound)
 	}
@@ -184,7 +185,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				sw.Header().Add(k, val)
 			}
 		}
-		h.emitMetrics(sw, r, traits, "", start, 0, 0, "none")
+		h.emitMetrics(sw, r, traits, mon)
 		sw.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -291,7 +292,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// non-GET/HEAD never touch the cache).
 	if policy.Cacheable && r.Method == http.MethodGet {
 		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
-			h.serveFromCache(sw, r, entry, key, start)
+			h.serveFromCache(sw, r, entry, mon, "cache_hit")
 			log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
 				clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
 			return
@@ -299,8 +300,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cacheStatus := string(policy.Mode) // edge→edge / bypass / private
 
-	up := h.fetchUpstream(r, v, targetURL, traits, passthrough, key, effectivePath)
-	h.finalize(sw, r, up, v, traits, passthrough, key, effectivePath, targetURL, cacheURL, policy, cacheStatus, start)
+	up := h.fetchUpstream(r, v, targetURL, traits, passthrough, key, effectivePath, mon)
+	h.finalize(sw, r, up, v, traits, passthrough, key, effectivePath, targetURL, cacheURL, policy, cacheStatus, start, mon)
 
 	log.Printf("%s %s%s → %s [%s] status=%d attempts=%d fetch_ms=%.1f total_ms=%.1f cache=%s",
 		clientIP(r), r.Method, r.URL.RequestURI(), targetURL, keyOrDash(key),
@@ -313,7 +314,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // for bare docker 401s), text rewriting (pypi/npm/flathub), hop-by-hop
 // stripping, cache-policy Cache-Control headers, disk-cache tee, security +
 // CORS + performance headers and streaming.
-func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamResult, v *view, traits Traits, passthrough bool, key, effectivePath, targetURL, cacheURL string, policy CachePolicy, cacheStatus string, start time.Time) {
+func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamResult, v *view, traits Traits, passthrough bool, key, effectivePath, targetURL, cacheURL string, policy CachePolicy, cacheStatus string, start time.Time, mon *performanceMonitor) {
 	resp := up.resp
 	defer func() {
 		if resp.Body != nil {
@@ -451,8 +452,20 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		security.AddSecurityHeaders(hdr)
 	}
 
+	// Range request answered with a full 200: the official implementation
+	// caches the complete body and re-matches with the Range header so the
+	// edge returns 206. Port that by spooling the body while teeing it into
+	// the cache, then serving the slice from the stored entry. When the entry
+	// could not be stored (per-file cap or IO error), replay the spooled full
+	// body as the original 200.
+	if r.Header.Get("Range") != "" && resp.StatusCode == http.StatusOK && cacheWriter != nil {
+		if h.serveRangeAfterFullCache(w, r, bodySrc, cacheWriter, cacheURL, mon) {
+			return
+		}
+	}
+
 	security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
-	h.emitMetrics(w, r, traits, key, start, up.fetchMs, up.attempts, cacheStatus)
+	h.emitMetrics(w, r, traits, mon)
 
 	w.WriteHeader(resp.StatusCode)
 	var copyErr error
@@ -470,22 +483,56 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	}
 }
 
-// emitMetrics sets the X-Performance-Metrics header (must run before the
-// response status is written).
-func (h *Handler) emitMetrics(w http.ResponseWriter, r *http.Request, traits Traits, key string, start time.Time, fetchMs float64, attempts int, cacheStatus string) {
+// serveRangeAfterFullCache ports the range_cache_hit_after_full_cache branch
+// of finalizeSuccessfulResponse: a Range request whose upstream answered 200
+// stores the full body and re-reads it through the Range header. The body is
+// spooled to a temp file so an over-cap cache entry can still be replayed in
+// full. Returns false only when spooling could not start (body untouched).
+func (h *Handler) serveRangeAfterFullCache(w http.ResponseWriter, r *http.Request, body io.Reader, cw *cache.Writer, cacheURL string, mon *performanceMonitor) bool {
+	tmp, err := os.CreateTemp("", "xget-range-*")
+	if err != nil {
+		return false
+	}
+	name := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+	}()
+
+	_, copyErr := io.Copy(io.MultiWriter(tmp, cw), body)
+	if copyErr != nil {
+		cw.Abort()
+	}
+	cw.Commit()
+
+	if copyErr == nil {
+		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
+			mon.mark("range_cache_hit_after_full_cache")
+			clear(w.Header())
+			h.serveFromCache(w, r, entry, mon, "")
+			return true
+		}
+	}
+
+	// Entry not stored (cap/IO): replay the spooled full body unchanged.
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return true
+	}
+	h.emitMetrics(w, r, Traits{}, mon)
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, tmp)
+	return true
+}
+
+// emitMetrics records the terminal "complete" mark and sets the
+// X-Performance-Metrics header (must run before the status is written).
+// Protocol requests still record marks upstream but omit the header.
+func (h *Handler) emitMetrics(w http.ResponseWriter, r *http.Request, traits Traits, mon *performanceMonitor) {
+	mon.mark("complete")
 	if traits.IsProtocol() {
 		return
 	}
-	metrics := map[string]any{
-		"total_ms":    round100(float64(time.Since(start).Microseconds()) / 1000.0),
-		"upstream_ms": round100(fetchMs),
-		"attempts":    attempts,
-		"platform":    key,
-		"cache":       cacheStatus,
-	}
-	if j, err := json.Marshal(metrics); err == nil {
-		w.Header().Set("X-Performance-Metrics", string(j))
-	}
+	w.Header().Set("X-Performance-Metrics", mon.json())
 }
 
 // rewriteEffectiveForProbe recomputes the effective (docker-normalized) path
@@ -518,10 +565,6 @@ func keyOrDash(k string) string {
 
 func joinMethods(list []string) string {
 	return strings.Join(list, ", ")
-}
-
-func round100(f float64) float64 {
-	return float64(int(f*100+0.5)) / 100
 }
 
 // regexpMustMatch compiles a JS-style pattern used once for /v2/auth.

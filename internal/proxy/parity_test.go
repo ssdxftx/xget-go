@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -353,7 +354,7 @@ func TestCacheHitServesExactStoredBytes(t *testing.T) {
 	if hit.Code != 200 {
 		t.Fatalf("hit status = %d, want 200", hit.Code)
 	}
-	if !strings.Contains(hit.Header().Get("X-Performance-Metrics"), `"cache":"hit"`) {
+	if !strings.Contains(hit.Header().Get("X-Performance-Metrics"), `"cache_hit"`) {
 		t.Fatalf("second request must be served from cache, metrics=%q", hit.Header().Get("X-Performance-Metrics"))
 	}
 	if hit.Body.String() != payload {
@@ -401,5 +402,121 @@ func TestCacheHitRangeSlicesStoredBody(t *testing.T) {
 	h.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusPartialContent || rec2.Body.String() != "0123456789" {
 		t.Fatalf("prefix slice: status=%d body=%q, want 206/0123456789", rec2.Code, rec2.Body.String())
+	}
+}
+
+// 13. Locally generated error contracts must match createErrorResponse
+// byte-for-byte: bare "text/plain" (no charset suffix) and an ISO timestamp
+// with Date#toISOString's fixed millisecond precision.
+func TestErrorContractHeadersAndTimestamp(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(500)
+			_, _ = io.WriteString(w, "boom")
+		})
+		return m
+	}())
+	h.cfg.MaxRetries = 1
+
+	// Local plain-text error: 405 for a non-allowed method.
+	req := httptest.NewRequest("POST", "/gist/file.tar.gz", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("Content-Type = %q, want bare text/plain", ct)
+	}
+
+	// Wrapped upstream error: JSON details with millisecond timestamp.
+	rec2 := doGet(h, "/gist/file.tar.gz", nil)
+	if rec2.Code != 500 {
+		t.Fatalf("status = %d, want 500", rec2.Code)
+	}
+	if ct := rec2.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if !reISOTimestamp.MatchString(rec2.Body.String()) {
+		t.Fatalf("body = %q, want a Date#toISOString style timestamp", rec2.Body.String())
+	}
+}
+
+var reISOTimestamp = regexp.MustCompile(`"timestamp":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"`)
+
+// 14. X-Performance-Metrics must serialize the upstream mark timeline
+// (attempt_N / success / client_error / cache_hit / complete), not a custom
+// summary object.
+func TestPerformanceMetricsMarks(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/missing") {
+				http.Error(w, "nope", 404)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, "payload")
+		})
+		return m
+	}())
+	h.cfg.MaxRetries = 1
+
+	ok := doGet(h, "/gist/data.bin", nil)
+	metrics := ok.Header().Get("X-Performance-Metrics")
+	for _, want := range []string{`"attempt_0"`, `"success"`, `"complete"`} {
+		if !strings.Contains(metrics, want) {
+			t.Fatalf("metrics = %q, want %s", metrics, want)
+		}
+	}
+	if strings.Contains(metrics, "total_ms") {
+		t.Fatalf("metrics = %q, must not carry the custom summary schema", metrics)
+	}
+
+	hit := doGet(h, "/gist/data.bin", nil)
+	if m := hit.Header().Get("X-Performance-Metrics"); !strings.Contains(m, `"cache_hit"`) {
+		t.Fatalf("metrics = %q, want cache_hit", m)
+	}
+
+	miss := doGet(h, "/gist/missing", nil)
+	if m := miss.Header().Get("X-Performance-Metrics"); !strings.Contains(m, `"client_error"`) {
+		t.Fatalf("metrics = %q, want client_error", m)
+	}
+}
+
+// 15. A Range request whose upstream ignores Range and answers 200 must be
+// cached in full and re-served as a 206 slice, marking
+// range_cache_hit_after_full_cache (port of the post-put cache re-match).
+func TestRangeAfterFullCacheSlicesAndMarks(t *testing.T) {
+	payload := "hello-world-payload"
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Deliberately ignores Range.
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, payload)
+		})
+		return m
+	}())
+
+	req := httptest.NewRequest("GET", "/gist/file.txt", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+	if got := rec.Body.String(); got != "hello" {
+		t.Fatalf("body = %q, want hello", got)
+	}
+	if cr := rec.Header().Get("Content-Range"); cr != "bytes 0-4/19" {
+		t.Fatalf("Content-Range = %q, want bytes 0-4/19", cr)
+	}
+	if m := rec.Header().Get("X-Performance-Metrics"); !strings.Contains(m, `"range_cache_hit_after_full_cache"`) {
+		t.Fatalf("metrics = %q, want range_cache_hit_after_full_cache", m)
 	}
 }

@@ -87,11 +87,15 @@ func joinComma(list []string) string {
 	return out
 }
 
+// isoTimestampLayout matches Date#toISOString: always UTC with exactly three
+// fractional digits and a trailing Z.
+const isoTimestampLayout = "2006-01-02T15:04:05.000Z"
+
 // WriteError emits a standardized error response with security headers,
 // port of createErrorResponse (plain text by default, JSON with details
 // when includeDetails is set).
 func WriteError(w http.ResponseWriter, r *http.Request, message string, status int, includeDetails bool) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Type", "text/plain")
 	if includeDetails {
 		w.Header().Set("Content-Type", "application/json")
 	}
@@ -106,7 +110,7 @@ func WriteError(w http.ResponseWriter, r *http.Request, message string, status i
 			Error     string `json:"error"`
 			Status    int    `json:"status"`
 			Timestamp string `json:"timestamp"`
-		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(time.RFC3339)})
+		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(isoTimestampLayout)})
 		_, _ = w.Write(payload)
 		return
 	}
@@ -118,14 +122,14 @@ func WriteError(w http.ResponseWriter, r *http.Request, message string, status i
 // responses, carrying security headers like createErrorResponse upstream.
 func BuildErrorResponse(message string, status int, includeDetails bool) *http.Response {
 	body := message
-	ct := "text/plain; charset=utf-8"
+	ct := "text/plain"
 	if includeDetails {
 		ct = "application/json"
 		payload, _ := json.Marshal(struct {
 			Error     string `json:"error"`
 			Status    int    `json:"status"`
 			Timestamp string `json:"timestamp"`
-		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(time.RFC3339)})
+		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(isoTimestampLayout)})
 		body = string(payload)
 	}
 	h := http.Header{}
