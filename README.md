@@ -4,6 +4,8 @@
 
 Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文件**：不依赖 Node.js、workerd 或任何运行时，拷贝到服务器即可运行。它为代码托管平台、AI 模型仓库、包管理器和容器镜像仓库提供统一的下载/拉取加速入口，**URL 结构与官方 Xget 完全同构**，客户端配置可直接沿用官方生态的既有约定。
 
+当前版本：**v3.0.5**（对齐上游 `0595fad`）。
+
 核心亮点：
 
 - **零依赖**：纯 Go 标准库实现，`CGO_ENABLED=0` 静态编译，无任何第三方包
@@ -60,6 +62,8 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。v3.0.1 以官方源码为基准完成第二轮全量审查（84 个平台目录逐项 diff + 请求管线/校验/协议/上游/缓存/改写/响应头逐模块比对，另附 8 项 mock 上游回归测试），修复 12 处偏差：可重试状态耗尽后返回最后一个上游响应（此前 304/5xx 耗尽会错误地得到合成 500，影响带 If-None-Match 的 docker manifest 条件请求）、Docker 匿名 token 重试保留原请求方法、token 服务响应接受任意 2xx、HEAD 不再读磁盘缓存（官方缓存读写均为 GET-only）、非预检响应的 Access-Control-Allow-Methods 恒为配置白名单（此前协议响应误用扩展表）、registry 自带 JSON UNAUTHORIZED 错误原样透传、主页 302 空响应体、nosniff/Accept-Ranges/Cache-Control 仅作用于 2xx、GET/HEAD 请求体不再转发上游、缓存键 basename/release tag 百分号解码、CORS Vary 合并去重、registry 重定向跟随失败并入重试链。v3.0.2 完成第三轮审查，聚焦错误响应契约与配置名对齐：错误包装门槛改为官方 `finalizeErrorResponse` 的“非 2xx”语义（此前仅包装非协议平台，现在 Docker 的非 401 错误——404/429/5xx——与标准平台一样获得 JSON 错误包装，Git/LFS/AI/HF 保持原样透传）、panic 恢复与 `/v2/auth` 内部失败（registry 不可达/挑战解析失败/token 服务不可达）统一为官方顶层 catch 的**纯文本** `500 Internal Server Error`（此前 panic 路径误用 JSON 契约、/v2/auth 失败误用 502）、缓存 TTL 变量改用官方名 `CACHE_DURATION`（`CACHE_TTL` 保留为兼容别名，优先级 CACHE_DURATION > CACHE_TTL），并修复一处**高危磁盘缓存 bug**：缓存条目 body 文件内的 JSON 元数据前导行此前未在命中读取时跳过，导致所有缓存命中响应会把前导与正文一并发送（超出声明的 Content-Length，客户端得到 0 字节或被截断的响应），同时 Range 断点切片的绝对偏移也会切进前导——本轮修复后命中响应与首次透传逐字节一致、命中后 Range 切片与上游原始切片逐字节一致，并新增 2 项 mock 回归（命中字节一致性 + 命中 Range 切片）锁死该行为。v3.0.3 完成第四轮审查，以同一 mock 上游分别驱动官方 Worker 与本移植版逐响应比对（24 项用例，状态/头/体全量 diff），修正 3 处可观测偏差：错误 JSON 的 `timestamp` 改用 `Date#toISOString` 的固定毫秒格式（`2026-10-27T04:12:21.313Z`，此前为无毫秒的 RFC3339）、本地纯文本错误响应改回裸 `text/plain`（去掉 `; charset=utf-8`）、`X-Performance-Metrics` 改为官方的 mark 时间线结构（`attempt_N`/`success`/`client_error`/`docker_auth_challenge`/`cache_hit`/`cache_hit_full_content`/`range_cache_hit_after_full_cache`/`complete`，替换此前自定义的 `total_ms`/`upstream_ms`/`attempts`/`platform`/`cache` 摘要），并补齐 Range 请求在上游返回 200 时“先写全量缓存再切片”的 `206` 路径，新增 3 项 mock 回归锁死这些契约。v3.0.4 继续第四轮复核的模块级源码比对，修正 3 处协议分支差异：`isGitRequest` 的 `service` 查询参数改为短路判定（存在但非两个 pack service 时直接判定为非 Git，此前仍会继续检查 Content-Type 而误判为 Git 并放行 POST）、`/v2/auth` 登录代理改回官方协议分支的响应头集合（仅 CORS，不再附加安全头）、协议类请求的主页 302 改回仅 CORS（安全头只随非协议请求的性能头路径下发），回归扩至 18 项。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
+v3.0.5 修复第五轮审计发现的 8 处运行时缺陷：Docker 直连 3xx（无 401 前置）因重定向请求复用了已被 `cancelBody.Close` 取消的 per-attempt context 而必然 502；匿名 token 重试后重定向跟随失败未检查失败标志导致空指针 panic（应为合成 401）；SSE/AI 流式响应缺少 Flush 导致整体缓冲到响应结束；压缩（gzip/br）缓存条目被 Range 请求按字节切片产生损坏的 206；缓存 416 响应沿用完整资源的陈旧 Content-Length；Range-after-full-cache 的超限回退分支丢失 CORS 头；改写读取上游 body 失败时静默返回截断内容（改为官方语义的纯文本 500）；HEAD 访问 PyPI 索引的 Cache-Control 对齐官方 `no-store`。同时补齐 `cache_hit_full_content` mark、错误响应显式 `Content-Length`，并将超时标志改为 `atomic.Bool`，新增 7 项回归测试。
+
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
 | 部署形态 | Cloudflare Workers / Docker(workerd) | **单二进制 / systemd / Docker / 裸机** |
@@ -83,7 +87,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 其余运行时层差异（官方源码语义已对齐，差异来自 Go 标准库与 Cloudflare Workers 运行时的能力边界）：
 
 - **URL 点段归一化**：Cloudflare/Node 在请求进入 Worker 之前就把 `/gh/../etc/passwd`、`/gh/%2e%2e/etc/passwd` 归一化为 `/etc/passwd`，官方因此落到 302 首页；Go 收到原始路径，按官方 `validateRequest` 的原始路径检查返回 400 `Invalid path`。直接以原始 URL 调用官方 `validateRequest` 同样返回 400，且官方测试仅要求明文 `..` 不得 500、编码穿越必须 400。
-- **`Accept-Encoding`**：Go 标准库没有 brotli 解码器，因此对可改写平台（PyPI 索引 / npm 元数据 / Flatpak 描述文件）强制 `identity`，保证改写基于明文；其余平台照常协商压缩，压缩体与 `Content-Encoding` 原样转发，客户端解压后内容一致。
+- **`Accept-Encoding`**：Go 标准库没有 brotli 解码器，因此对可改写平台（PyPI 索引 / npm 元数据 / Flatpak 描述文件）强制 `identity`，保证改写基于明文；其余平台固定向上游请求 `gzip, deflate, br`，压缩体与 `Content-Encoding` 原样转发，客户端需要支持对应编码（`br` 由客户端自带解码器处理）。带 `Range` 的请求强制 `identity`，避免压缩体被按字节切片。
 - **HEAD + 可改写平台**：官方对 HEAD 响应也会执行改写，`response.text()` 为空导致 `Content-Length: 0`；本移植版跳过 HEAD 改写，保留上游长度，避免把真实长度抹成 0。
 
 ## 支持的平台前缀

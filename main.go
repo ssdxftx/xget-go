@@ -27,7 +27,7 @@ import (
 	"xget/internal/proxy"
 )
 
-var version = "dev"
+var version = "v3.0.5"
 
 func main() {
 	if len(os.Args) > 1 {

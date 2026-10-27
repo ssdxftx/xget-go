@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xget/internal/platform"
@@ -243,7 +244,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 	baseHeaders := buildHeaders(in, v, passthrough, targetURL, traits, key)
 	var resp *http.Response
 	var actualAttempts int
-	timerFired := false
+	var timerFired atomic.Bool
 	transportFailed := false
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -261,10 +262,10 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 
 		// Timeout bounds time-to-headers only; once headers arrive the
 		// timer is stopped so multi-GB downloads stream without cutoff.
-		timerFired = false
+		timerFired.Store(false)
 		attemptCtx, cancel := context.WithCancel(in.Context())
 		timer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
-			timerFired = true
+			timerFired.Store(true)
 			cancel()
 		})
 		req = req.WithContext(attemptCtx)
@@ -273,7 +274,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		if err != nil {
 			timer.Stop()
 			cancel()
-			if timerFired {
+			if timerFired.Load() {
 				return localTextResult(in.Context(), "Request timeout", http.StatusRequestTimeout)
 			}
 			if in.Context().Err() != nil {
@@ -301,7 +302,10 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 
 		if traits.Docker {
 			var redirFailed bool
-			r, redirFailed = h.followDockerRedirect(r, baseHeaders, body)
+			// Use the parent request context: closing the 3xx body cancels
+			// the per-attempt context (cancelBody), so resp.Request.Context()
+			// is already dead by the time the redirect request is built.
+			r, redirFailed = h.followDockerRedirect(in.Context(), r, baseHeaders, body)
 			if redirFailed {
 				// Same contract as a fetch exception while chasing a
 				// registry redirect: retry, then 502 on the final try.
@@ -391,7 +395,7 @@ func redirectStatus(code int) bool {
 // reports a transport-level failure while chasing the redirect so the retry
 // loop can classify exhaustion as a 502 — the contract the original gets
 // via fetch exceptions.
-func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool) {
+func (h *Handler) followDockerRedirect(ctx context.Context, resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool) {
 	if !redirectStatus(resp.StatusCode) {
 		return resp, false
 	}
@@ -409,7 +413,7 @@ func (h *Handler) followDockerRedirect(resp *http.Response, headers http.Header,
 	hdr := headers.Clone()
 	hdr.Del("Authorization")
 	bodyRc, _ := body.get()
-	req, err := http.NewRequestWithContext(resp.Request.Context(), resp.Request.Method, next.String(), bodyRc)
+	req, err := http.NewRequestWithContext(ctx, resp.Request.Method, next.String(), bodyRc)
 	if err != nil {
 		return nil, true
 	}
@@ -483,7 +487,12 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 	if err != nil {
 		return deny()
 	}
-	retryResp, _ = h.followDockerRedirect(retryResp, hdr, body)
+	// followDockerRedirect returns (nil, true) when the redirect chase fails;
+	// the original catches that exception and falls back to the 401 challenge.
+	retryResp, redirFailed := h.followDockerRedirect(ctx, retryResp, hdr, body)
+	if redirFailed {
+		return deny()
+	}
 	if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 		challenge.Body.Close()
 		return retryResp

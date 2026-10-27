@@ -37,6 +37,14 @@ func requestOrigin(r *http.Request) string {
 // text rewriting (index/metadata pages are far smaller in practice).
 const rewriteMaxBytes = 32 << 20
 
+// cacheEntrySliceable reports whether a cached body can be sliced with a
+// byte Range. Compressed representations (gzip/br/deflate) are stored as the
+// encoded bytes, so slicing them yields a corrupt partial stream.
+func cacheEntrySliceable(entry *cache.Entry) bool {
+	enc := strings.TrimSpace(entry.Header.Get("Content-Encoding"))
+	return enc == "" || strings.EqualFold(enc, "identity")
+}
+
 // parseSingleRange parses a single "bytes=a-b" / "bytes=a-" / "bytes=-n"
 // specification against size. ok=false means "unsupported → serve full".
 func parseSingleRange(spec string, size int64) (start, end int64, ok bool) {
@@ -108,6 +116,9 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	body, bodyStart, err := entry.OpenBody()
 	if err != nil {
 		// Entry vanished between Get and open; no upstream fallback here.
+		// Drop the stored Content-Length so the error body is not framed
+		// with the full resource size.
+		hdr.Del("Content-Length")
 		security.WriteError(w, r, "Cached resource unavailable", http.StatusBadGateway, false)
 		return
 	}
@@ -120,6 +131,11 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	}
 
 	spec := r.Header.Get("Range")
+	// A compressed cached body cannot be sliced; serve the full stored body
+	// (still correctly framed) instead of a corrupt partial stream.
+	if spec != "" && !cacheEntrySliceable(entry) {
+		spec = ""
+	}
 	if start64, end64, ok := parseSingleRange(spec, entry.Size); ok {
 		hdr.Set("Content-Range", cache.FormatRange(start64, end64, entry.Size))
 		hdr.Set("Content-Length", strconv.FormatInt(end64-start64+1, 10))
@@ -133,6 +149,9 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	}
 	if spec != "" && strings.HasPrefix(spec, "bytes=") && rangeUnsatisfiable(spec, entry.Size) {
 		hdr.Set("Content-Range", fmt.Sprintf("bytes */%d", entry.Size))
+		// The stored Content-Length describes the full resource; the 416 body
+		// is the short error message, so drop the stale length.
+		hdr.Del("Content-Length")
 		security.WriteError(w, r, "Requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable, false)
 		return
 	}

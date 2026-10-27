@@ -55,6 +55,42 @@ func (sw *statusWriter) Write(p []byte) (int, error) {
 	return sw.ResponseWriter.Write(p)
 }
 
+// Flush forwards to the underlying writer so streaming responses (SSE/AI)
+// reach the client as chunks arrive instead of sitting in net/http's buffer.
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		if !sw.wrote {
+			sw.status = http.StatusOK
+			sw.wrote = true
+		}
+		f.Flush()
+	}
+}
+
+// flushWriter flushes after every write. Used for streaming bodies so
+// small SSE events are not delayed until the handler returns.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw *flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+// streamingResponse reports whether the body is consumed incrementally by
+// the client and should therefore be flushed on every write.
+func streamingResponse(resp *http.Response, traits Traits) bool {
+	if traits.AI || traits.HF {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
 // Handler serves the accelerated proxy.
 type Handler struct {
 	cfg          *config.Config
@@ -296,10 +332,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// non-GET/HEAD never touch the cache).
 	if policy.Cacheable && r.Method == http.MethodGet {
 		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
-			h.serveFromCache(sw, r, entry, mon, "cache_hit")
-			log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
-				clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
-			return
+			// Byte-range slicing is only valid for identity-encoded bodies.
+			// A compressed entry (gzip/br/deflate) must not be sliced; skip
+			// the hit and refetch, because Range requests are sent upstream
+			// with Accept-Encoding: identity.
+			if r.Header.Get("Range") == "" || cacheEntrySliceable(entry) {
+				hitMark := "cache_hit"
+				if r.Header.Get("Range") != "" {
+					// A Range request served from a full cached entry mirrors
+					// the official cache_hit_full_content mark.
+					hitMark = "cache_hit_full_content"
+				}
+				h.serveFromCache(sw, r, entry, mon, hitMark)
+				log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
+					clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
+				return
+			}
 		}
 	}
 	cacheStatus := string(policy.Mode) // edge→edge / bypass / private
@@ -414,10 +462,23 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	// run for every ok (2xx) response).
 	var bodySrc io.Reader = resp.Body
 	originBoundRewrite := false
-	if !traits.IsProtocol() && r.Method == http.MethodGet &&
+	rewriteCandidate := !traits.IsProtocol() &&
 		resp.StatusCode >= 200 && resp.StatusCode < 300 &&
-		shouldRewriteTextResponse(key, effectivePath, resp.Header.Get("Content-Type")) {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, rewriteMaxBytes+1))
+		shouldRewriteTextResponse(key, effectivePath, resp.Header.Get("Content-Type"))
+	if rewriteCandidate && r.Method == http.MethodGet {
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, rewriteMaxBytes+1))
+		if readErr != nil {
+			// The upstream stream broke mid-body. Returning the partial
+			// content would silently truncate a metadata/index response, so
+			// mirror the official top-level catch with a plain-text 500.
+			resp.Body.Close()
+			clear(hdr)
+			security.AddSecurityHeaders(hdr)
+			security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+			h.emitMetrics(w, r, traits, mon)
+			security.WriteError(w, r, "Internal Server Error", http.StatusInternalServerError, false)
+			return
+		}
 		if len(raw) <= rewriteMaxBytes {
 			rewritten := rewriteTextResponse(key, effectivePath, string(raw), requestOrigin(r))
 			bodySrc = strings.NewReader(rewritten)
@@ -427,6 +488,12 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		} else {
 			bodySrc = io.MultiReader(bytes.NewReader(raw), resp.Body)
 		}
+	} else if rewriteCandidate && key == "pypi" {
+		// HEAD on a rewritable PyPI index: the official flow still runs the
+		// rewrite (the empty HEAD body becomes ""), which marks the response
+		// host-bound and downgrades it to no-store. Mirror that policy
+		// decision while keeping the real Content-Length from the probe.
+		originBoundRewrite = true
 	}
 
 	// Cache-policy headers + disk-cache write (port of finalizeSuccessfulResponse:
@@ -478,6 +545,16 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		if cacheWriter != nil {
 			dst = io.MultiWriter(w, cacheWriter)
 		}
+		// Streaming bodies (SSE / AI inference) must be flushed as they
+		// arrive; otherwise net/http buffers small events until the whole
+		// response completes.
+		if f, ok := w.(http.Flusher); ok && streamingResponse(resp, traits) {
+			if cacheWriter != nil {
+				dst = io.MultiWriter(&flushWriter{w: w, f: f}, cacheWriter)
+			} else {
+				dst = &flushWriter{w: w, f: f}
+			}
+		}
 		_, copyErr = io.Copy(dst, bodySrc)
 	}
 	if copyErr != nil {
@@ -510,7 +587,7 @@ func (h *Handler) serveRangeAfterFullCache(w http.ResponseWriter, r *http.Reques
 	cw.Commit()
 
 	if copyErr == nil {
-		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
+		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil && cacheEntrySliceable(entry) {
 			mon.mark("range_cache_hit_after_full_cache")
 			clear(w.Header())
 			h.serveFromCache(w, r, entry, mon, "")
@@ -522,6 +599,7 @@ func (h *Handler) serveRangeAfterFullCache(w http.ResponseWriter, r *http.Reques
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 		return true
 	}
+	security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
 	h.emitMetrics(w, r, Traits{}, mon)
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, tmp)

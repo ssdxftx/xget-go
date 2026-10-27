@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -95,26 +96,27 @@ const isoTimestampLayout = "2006-01-02T15:04:05.000Z"
 // port of createErrorResponse (plain text by default, JSON with details
 // when includeDetails is set).
 func WriteError(w http.ResponseWriter, r *http.Request, message string, status int, includeDetails bool) {
-	w.Header().Set("Content-Type", "text/plain")
+	payload := []byte(message)
+	contentType := "text/plain"
 	if includeDetails {
-		w.Header().Set("Content-Type", "application/json")
+		contentType = "application/json"
+		payload, _ = json.Marshal(struct {
+			Error     string `json:"error"`
+			Status    int    `json:"status"`
+			Timestamp string `json:"timestamp"`
+		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(isoTimestampLayout)})
 	}
+	w.Header().Set("Content-Type", contentType)
+	// Frame the body explicitly so error responses (e.g. a cached 416) never
+	// inherit a stale Content-Length from a previously copied resource.
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 	AddSecurityHeaders(w.Header())
 	w.WriteHeader(status)
 
 	if r.Method == http.MethodHead {
 		return
 	}
-	if includeDetails {
-		payload, _ := json.Marshal(struct {
-			Error     string `json:"error"`
-			Status    int    `json:"status"`
-			Timestamp string `json:"timestamp"`
-		}{Error: message, Status: status, Timestamp: time.Now().UTC().Format(isoTimestampLayout)})
-		_, _ = w.Write(payload)
-		return
-	}
-	_, _ = w.Write([]byte(message))
+	_, _ = w.Write(payload)
 }
 
 // BuildErrorResponse constructs a local (non-proxied) error response as an
@@ -134,6 +136,7 @@ func BuildErrorResponse(message string, status int, includeDetails bool) *http.R
 	}
 	h := http.Header{}
 	h.Set("Content-Type", ct)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	AddSecurityHeaders(h)
 	return &http.Response{
 		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
