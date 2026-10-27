@@ -520,3 +520,83 @@ func TestRangeAfterFullCacheSlicesAndMarks(t *testing.T) {
 		t.Fatalf("metrics = %q, want range_cache_hit_after_full_cache", m)
 	}
 }
+
+// 16. A present `service` query parameter short-circuits Git detection: any
+// value other than the two pack services means the request is NOT a Git
+// protocol request, so the method whitelist still applies (official early
+// return inside isGitRequest).
+func TestGitServiceParamShortCircuits(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+		})
+		return m
+	}())
+
+	req := httptest.NewRequest("POST", "/gist/x?service=other", nil)
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 (service=other must not count as Git)", rec.Code)
+	}
+
+	// The two real pack services still mark the request as Git and allow POST.
+	req2 := httptest.NewRequest("POST", "/gist/x?service=git-upload-pack", nil)
+	req2.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (git-upload-pack keeps protocol passthrough)", rec2.Code)
+	}
+}
+
+// 17. The /v2/auth login proxy relays the upstream probe/token response
+// through the protocol branch, which adds CORS only — no security headers
+// (official handleDockerAuth returns the raw Response).
+func TestDockerAuthProxyOmitsSecurityHeaders(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, "{}")
+		})
+		return m
+	}())
+
+	rec := doGet(h, "/cr/quay/v2/auth?scope=repository:test/repo:pull", nil)
+	if rec.Code != 200 || rec.Body.String() != "{}" {
+		t.Fatalf("status=%d body=%q, want 200/{}", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Strict-Transport-Security") != "" {
+		t.Fatalf("security headers must be omitted for the protocol-branch auth proxy")
+	}
+}
+
+// 18. Homepage redirects for protocol requests carry CORS only; the security
+// headers reach non-protocol redirects through the performance-header path.
+func TestHomepageRedirectSecurityHeadersByTraits(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+		return m
+	}())
+
+	git := doGet(h, "/unknown/x", map[string]string{"User-Agent": "git/2.34.1"})
+	if git.Code != http.StatusFound {
+		t.Fatalf("git redirect status = %d, want 302", git.Code)
+	}
+	if git.Header().Get("Strict-Transport-Security") != "" {
+		t.Fatalf("protocol redirects must not carry security headers")
+	}
+
+	plain := doGet(h, "/unknown/x", nil)
+	if plain.Code != http.StatusFound {
+		t.Fatalf("redirect status = %d, want 302", plain.Code)
+	}
+	if plain.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatalf("non-protocol redirects must carry security headers")
+	}
+}

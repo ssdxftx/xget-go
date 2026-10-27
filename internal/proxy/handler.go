@@ -154,7 +154,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Homepage redirect mirrors Response.redirect: Location + 302, empty body.
 	localRedirect := func(tr Traits, target string) {
-		security.AddSecurityHeaders(sw.Header())
+		// Security headers reach non-protocol redirects through the
+		// performance-header path upstream; protocol redirects carry CORS only.
+		if !tr.IsProtocol() {
+			security.AddSecurityHeaders(sw.Header())
+		}
 		security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
 		h.emitMetrics(sw, r, tr, mon)
 		sw.Header().Set("Location", target)

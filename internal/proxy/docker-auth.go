@@ -120,7 +120,8 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 				hdr.Add(k, v)
 			}
 		}
-		security.AddSecurityHeaders(hdr)
+		// The official flow returns the upstream probe/token response through
+		// the protocol branch of handleRequest, which only adds CORS headers.
 		security.AddCorsHeaders(hdr, r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
 		w.WriteHeader(resp.StatusCode)
 		if r.Method != http.MethodHead && resp.Body != nil {

@@ -103,8 +103,12 @@ func isGitRequest(v *view) bool {
 	if strings.Contains(ua, "git/") || strings.HasPrefix(ua, "git/") {
 		return true
 	}
-	if svc := v.Query.Get("service"); svc == "git-upload-pack" || svc == "git-receive-pack" {
-		return true
+	// A present service parameter short-circuits the remaining checks: any
+	// value other than the two pack services means "not a Git request"
+	// (mirrors the early return in isGitRequest).
+	if _, hasService := v.Query["service"]; hasService {
+		svc := v.Query.Get("service")
+		return svc == "git-upload-pack" || svc == "git-receive-pack"
 	}
 	ct := v.ContentType
 	if strings.Contains(ct, "git-upload-pack") || strings.Contains(ct, "git-receive-pack") {
