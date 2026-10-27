@@ -28,6 +28,18 @@ type Config struct {
 	AllowedOrigins []string // ALLOWED_ORIGINS (CORS, "*" allows all)
 }
 
+// cacheTTLFromEnv resolves the mutable-cache fallback TTL. CACHE_DURATION is
+// the official upstream variable name and follows the official
+// parsePositiveInteger semantics (minimum 1, invalid values fall back to 300);
+// CACHE_TTL is the legacy Go-port name kept for backward compatibility.
+// CACHE_DURATION wins when both are set.
+func cacheTTLFromEnv() int {
+	if _, ok := os.LookupEnv("CACHE_DURATION"); ok && strings.TrimSpace(os.Getenv("CACHE_DURATION")) != "" {
+		return envInt("CACHE_DURATION", 300, 1)
+	}
+	return envInt("CACHE_TTL", 300, 0)
+}
+
 func envDefault(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
@@ -74,7 +86,7 @@ func FromEnv() *Config {
 		MaxRetries:    envInt("MAX_RETRIES", 3, 1),
 		RetryDelayMs:  envInt("RETRY_DELAY_MS", 1000, 0),
 		MaxPathLength: envInt("MAX_PATH_LENGTH", 2048, 1),
-		CacheTTL:      envInt("CACHE_TTL", 300, 0),
+		CacheTTL:      cacheTTLFromEnv(),
 
 		CacheDir:       cacheDir,
 		CacheMaxMB:     envInt("CACHE_MAX_MB", 1024, 1),

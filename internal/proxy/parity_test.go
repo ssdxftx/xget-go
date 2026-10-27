@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -272,5 +273,133 @@ func TestGetBodyNotForwarded(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if gotBody != "" {
 		t.Fatalf("upstream received GET body %q; official drops bodies for GET/HEAD", gotBody)
+	}
+}
+
+// 9. Docker non-401 upstream errors (404/429/5xx) get the standard JSON
+// error contract, exactly like standard platforms — the official
+// finalizeErrorResponse only exempts 401 (docker) and git/LFS/AI/HF.
+func TestDockerNon401ErrorGetsStandardWrap(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = io.WriteString(w, `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}`)
+		})
+		return m
+	}())
+	h.cfg.MaxRetries = 1
+
+	rec := doGet(h, "/cr/quay/v2/repo/manifests/latest", nil)
+	if rec.Code != 404 {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Upstream server error (404)") {
+		t.Fatalf("body = %q, want the standard wrap applied to docker non-401 errors", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MANIFEST_UNKNOWN") {
+		t.Fatalf("body = %q, want the upstream error text preserved inside the contract", rec.Body.String())
+	}
+}
+
+// 10. Git/LFS/AI/HF upstream errors pass through raw for every status
+// (official early return before the standard wrap).
+func TestGitErrorsAlwaysPassThrough(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "repository not found", 404)
+		})
+		return m
+	}())
+	h.cfg.MaxRetries = 1
+
+	rec := doGet(h, "/gist/repo.git/info/refs", map[string]string{"User-Agent": "git/2.34.1"})
+	if rec.Code != 404 {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "Upstream server error") {
+		t.Fatalf("body = %q, git protocol errors must relay raw", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "repository not found") {
+		t.Fatalf("body = %q, want the upstream error body untouched", rec.Body.String())
+	}
+}
+
+// 11. A cache hit must serve EXACTLY the body bytes stored on the miss —
+// the JSON preamble line that Begin() writes into the body file must never
+// leak into a served response (regression: hits once sent preamble+body,
+// overflowing the declared Content-Length and truncating the client body).
+func TestCacheHitServesExactStoredBytes(t *testing.T) {
+	payload := strings.Repeat("xget-cache-payload;", 300) // 5700 bytes, > preamble
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, payload)
+		})
+		return m
+	}())
+
+	miss := doGet(h, "/gist/data.bin", nil)
+	if miss.Code != 200 || miss.Body.String() != payload {
+		t.Fatalf("miss: status=%d len=%d, want 200/%d", miss.Code, miss.Body.Len(), len(payload))
+	}
+
+	hit := doGet(h, "/gist/data.bin", nil)
+	if hit.Code != 200 {
+		t.Fatalf("hit status = %d, want 200", hit.Code)
+	}
+	if !strings.Contains(hit.Header().Get("X-Performance-Metrics"), `"cache":"hit"`) {
+		t.Fatalf("second request must be served from cache, metrics=%q", hit.Header().Get("X-Performance-Metrics"))
+	}
+	if hit.Body.String() != payload {
+		t.Fatalf("hit body len=%d, want exactly %d stored bytes (preamble leak?)", hit.Body.Len(), len(payload))
+	}
+}
+
+// 12. Range requests served from a disk-cache hit must slice the STORED
+// body, not the raw file (the JSON preamble would otherwise shift every
+// absolute Seek and corrupt the slice).
+func TestCacheHitRangeSlicesStoredBody(t *testing.T) {
+	payload := strings.Repeat("0123456789", 200) // 2000 bytes
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, payload)
+		})
+		return m
+	}())
+
+	if rec := doGet(h, "/gist/movie.bin", nil); rec.Code != 200 {
+		t.Fatalf("miss status = %d, want 200", rec.Code)
+	}
+
+	req := httptest.NewRequest("GET", "/gist/movie.bin", nil)
+	req.Header.Set("Range", "bytes=1990-1999")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+	if got := rec.Body.String(); got != "0123456789" {
+		t.Fatalf("range slice = %q, want the last 10 stored bytes", got)
+	}
+	if cr := rec.Header().Get("Content-Range"); cr != "bytes 1990-1999/2000" {
+		t.Fatalf("Content-Range = %q, want bytes 1990-1999/2000", cr)
+	}
+
+	// Prefix range crossing no preamble either.
+	req2 := httptest.NewRequest("GET", "/gist/movie.bin", nil)
+	req2.Header.Set("Range", "bytes=0-9")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusPartialContent || rec2.Body.String() != "0123456789" {
+		t.Fatalf("prefix slice: status=%d body=%q, want 206/0123456789", rec2.Code, rec2.Body.String())
 	}
 }

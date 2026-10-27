@@ -8,10 +8,12 @@
 package cache
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -368,5 +370,42 @@ func (s *Store) evict(protect string) {
 	s.mu.Unlock()
 }
 
-// OpenBody opens the cached body file for serving.
-func (e *Entry) OpenBody() (*os.File, error) { return os.Open(e.Body) }
+// OpenBody opens the cached body file positioned after the JSON preamble
+// line that Begin() writes ahead of the body bytes, ready to serve exactly
+// e.Size bytes. The second return value is the absolute file offset of the
+// body start (callers must add it when seeking for Range slices, because
+// seeks are absolute).
+func (e *Entry) OpenBody() (*os.File, int64, error) {
+	f, err := os.Open(e.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	line, err := readFirstLine(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	start := int64(len(line))
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	return f, start, nil
+}
+
+// readFirstLine reads up to and including the first '\n' using a small
+// buffer, then rewinds the file so a plain Seek can position it precisely.
+func readFirstLine(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	br := bufio.NewReaderSize(f, 8192)
+	line, err := br.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return line, nil
+}

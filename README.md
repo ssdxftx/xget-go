@@ -58,7 +58,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 
 ## 与官方版的差异
 
-v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。v3.0.1 以官方源码为基准完成第二轮全量审查（84 个平台目录逐项 diff + 请求管线/校验/协议/上游/缓存/改写/响应头逐模块比对，另附 8 项 mock 上游回归测试），修复 12 处偏差：可重试状态耗尽后返回最后一个上游响应（此前 304/5xx 耗尽会错误地得到合成 500，影响带 If-None-Match 的 docker manifest 条件请求）、Docker 匿名 token 重试保留原请求方法、token 服务响应接受任意 2xx、HEAD 不再读磁盘缓存（官方缓存读写均为 GET-only）、非预检响应的 Access-Control-Allow-Methods 恒为配置白名单（此前协议响应误用扩展表）、registry 自带 JSON UNAUTHORIZED 错误原样透传、主页 302 空响应体、nosniff/Accept-Ranges/Cache-Control 仅作用于 2xx、GET/HEAD 请求体不再转发上游、缓存键 basename/release tag 百分号解码、CORS Vary 合并去重、registry 重定向跟随失败并入重试链。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
+v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官方版的登录链、AI 前缀、内容改写与缓存均已实现（缓存以本地磁盘层替代 Cloudflare 边缘缓存，行为同构、TTL 分级一致）。v2.0.1 对照官方源码逐文件复核了移植一致性，修正了 8 处行为偏差（Jenkins 更新中心路径改写、含百分号编码路径的校验判定、本地生成响应的全局响应头、网络错误耗尽重试的 502 语义、pypi 改写页缓存旁路、npm/flathub 改写内容的缓存键区分、Git/LFS 协议缺省头、Token 服务查询参数编码）。v3.0.1 以官方源码为基准完成第二轮全量审查（84 个平台目录逐项 diff + 请求管线/校验/协议/上游/缓存/改写/响应头逐模块比对，另附 8 项 mock 上游回归测试），修复 12 处偏差：可重试状态耗尽后返回最后一个上游响应（此前 304/5xx 耗尽会错误地得到合成 500，影响带 If-None-Match 的 docker manifest 条件请求）、Docker 匿名 token 重试保留原请求方法、token 服务响应接受任意 2xx、HEAD 不再读磁盘缓存（官方缓存读写均为 GET-only）、非预检响应的 Access-Control-Allow-Methods 恒为配置白名单（此前协议响应误用扩展表）、registry 自带 JSON UNAUTHORIZED 错误原样透传、主页 302 空响应体、nosniff/Accept-Ranges/Cache-Control 仅作用于 2xx、GET/HEAD 请求体不再转发上游、缓存键 basename/release tag 百分号解码、CORS Vary 合并去重、registry 重定向跟随失败并入重试链。v3.0.2 完成第三轮审查，聚焦错误响应契约与配置名对齐：错误包装门槛改为官方 `finalizeErrorResponse` 的“非 2xx”语义（此前仅包装非协议平台，现在 Docker 的非 401 错误——404/429/5xx——与标准平台一样获得 JSON 错误包装，Git/LFS/AI/HF 保持原样透传）、panic 恢复与 `/v2/auth` 内部失败（registry 不可达/挑战解析失败/token 服务不可达）统一为官方顶层 catch 的**纯文本** `500 Internal Server Error`（此前 panic 路径误用 JSON 契约、/v2/auth 失败误用 502）、缓存 TTL 变量改用官方名 `CACHE_DURATION`（`CACHE_TTL` 保留为兼容别名，优先级 CACHE_DURATION > CACHE_TTL），并修复一处**高危磁盘缓存 bug**：缓存条目 body 文件内的 JSON 元数据前导行此前未在命中读取时跳过，导致所有缓存命中响应会把前导与正文一并发送（超出声明的 Content-Length，客户端得到 0 字节或被截断的响应），同时 Range 断点切片的绝对偏移也会切进前导——本轮修复后命中响应与首次透传逐字节一致、命中后 Range 切片与上游原始切片逐字节一致，并新增 2 项 mock 回归（命中字节一致性 + 命中 Range 切片）锁死该行为。**v3.0.0 移除了实例级 token 鉴权**，鉴权行为与官方完全一致：无实例门禁，`Authorization` 头作为上游凭证纯透传（此前版本会把 Bearer 消费为实例门禁，与私有仓库凭证透传冲突）——这是一处**破坏性变更**，升级后请改用反代层鉴权（见[鉴权与凭证透传](#鉴权与凭证透传)）。
 
 | 能力 | 官方版 (Workers) | 本移植版 |
 |------|-----------------|----------|
@@ -190,7 +190,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 ```bash
 git clone https://github.com/ssdxftx/xget-go.git
 cd xget-go
-./build.sh v3.0.1        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
+./build.sh v3.0.2        # 产出 linux-amd64 / linux-arm64 / darwin-arm64 三个静态二进制
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择（uname -m 确认）
 
 # 前台试用（默认 8080 端口 —— 仅限内网/本机！）
@@ -267,7 +267,7 @@ PORT=8080 xget-go
 启动日志示例：
 
 ```
-xget-go v3.0.1 starting — port=8080 retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
+xget-go v3.0.2 starting — port=8080 retries=3 timeout=30s platforms=84 cache=/var/lib/xget/cache (max 1024MB/file 512MB)
 auth: none (parity with the official Xget) — expose via a reverse proxy with auth or a firewall/allowlist if the instance must not be public
 listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```
@@ -281,7 +281,7 @@ listening on http://0.0.0.0:8080 — usage: http://<host>:8080/<prefix>/<path>
 ```bash
 sudo cp xget-linux-amd64 /usr/local/bin/xget-go   # 按服务器架构选择
 sudo chmod 0755 /usr/local/bin/xget-go
-xget-go --version        # → xget-go v3.0.1 (port of xixu-me/Xget, AGPL-3.0-or-later)
+xget-go --version        # → xget-go v3.0.2 (port of xixu-me/Xget, AGPL-3.0-or-later)
 sudo mkdir -p /var/lib/xget /etc/xget
 ```
 
@@ -490,7 +490,8 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 | `MAX_RETRIES` | `3` | 上游请求失败的最大尝试次数 |
 | `RETRY_DELAY_MS` | `1000` | 线性退避基数：第 N 次重试前等待 `N × RETRY_DELAY_MS` 毫秒 |
 | `MAX_PATH_LENGTH` | `2048` | URL 路径长度上限，超长返回 `414` |
-| `CACHE_TTL` | `300` | 可变资源的磁盘缓存 TTL（秒），同时作为 `Cache-Control: s-maxage` 提示。与官方 `CACHE_DURATION` 默认值一致 |
+| `CACHE_DURATION` | `300` | 可变资源的磁盘缓存 TTL（秒），同时作为 `Cache-Control: s-maxage` 提示。**官方同名变量**；`CACHE_TTL` 仍可用作兼容别名，两者同时设置时 `CACHE_DURATION` 优先 |
+| `CACHE_TTL` | `300` | ⚠️ 已废弃的旧名（v3.0.2 前的本移植版变量名），仅为兼容保留；语义同 `CACHE_DURATION`，建议迁移到官方名 |
 | `CACHE_DIR` | `cache` | 磁盘缓存目录（相对工作目录）；设为 `off`/`none` 关闭缓存，回到纯透传模式 |
 | `CACHE_MAX_MB` | `1024` | 缓存总容量预算（MB），超出后按 LRU 驱逐 |
 | `CACHE_MAX_FILE_MB` | `512` | 单个缓存条目上限（MB），更大的文件只透传不缓存 |
@@ -508,7 +509,7 @@ Git/LFS/Docker/AI/Hugging Face 协议请求不受 `ALLOWED_METHODS` 约束（协
 |------|------|----------|------------|
 | 不可变产物 | npm `.tgz`、PyPI 版本化包文件、Maven 非 SNAPSHOT、crates `.crate`、rubygems `.gem`、GitHub release 附件（带版本 tag） | 86400s | `max-age=3600, immutable` |
 | 元数据/索引 | npm 包元数据、`/pypi/simple/`、`maven-metadata.xml`、flathub summary | 60s | `max-age=0, must-revalidate` |
-| 可变资源 | 其余 200 GET | `CACHE_TTL`（默认 300s） | `max-age=0, must-revalidate` |
+| 可变资源 | 其余 200 GET | `CACHE_DURATION`（默认 300s） | `max-age=0, must-revalidate` |
 | 私有 | 请求带 `Authorization`/`Cookie`，或上游返回 `Set-Cookie`/`private` | 不缓存 | `private, no-store` + `Vary` |
 | 旁路 | Git/LFS/Docker/AI/HF 协议、非 GET/HEAD | 不缓存 | `no-store` |
 
@@ -802,11 +803,11 @@ healthz? → 协议识别(Git/LFS/Docker/AI/HF) → CORS 预检
 
 ## 实测覆盖场景
 
-v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿；v3.0.0 鉴权对齐改造后复验（无门禁、凭证透传、git/docker 链路、缓存行为不变）：v3.0.1 二轮审查后以 8 项 mock 上游回归（重试耗尽返回最后上游响应、304 条件透传、匿名重试保留 PUT 方法与 2xx token、HEAD 不读缓存、配置化 ACA-M、302 空体、registry JSON 401 透传、GET 不转发请求体）加 12 项真实上游冒烟复验全绿：
+v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例全绿）；v2.0.1 一致性审查后另以 34 项回归用例（覆盖 Jenkins 改写、百分号编码校验、全局响应头、Docker 匿名链、Range/HEAD 回填、真实 git clone、磁盘缓存命中、pypi/npm 改写与旁路）复验全绿；v3.0.0 鉴权对齐改造后复验（无门禁、凭证透传、git/docker 链路、缓存行为不变）：v3.0.1 二轮审查后以 8 项 mock 上游回归（重试耗尽返回最后上游响应、304 条件透传、匿名重试保留 PUT 方法与 2xx token、HEAD 不读缓存、配置化 ACA-M、302 空体、registry JSON 401 透传、GET 不转发请求体）加 12 项真实上游冒烟复验全绿；v3.0.2 三轮审查后回归扩至 12 项 mock 测试（新增 Docker 非 401 错误获得标准 JSON 包装、Git 协议错误全状态码原样透传、缓存命中体与首次透传逐字节一致、命中 Range 切片字节正确），12 项全绿：
 
 - `git clone` / `ls-remote`（GitHub）、Git 协议 header 透传
 - GitHub release 下载（HEAD Content-Length 探测回填）、`Range` → `206` 断点续传
-- **磁盘缓存**：首次 `miss` 落盘 → 二次 `hit`（0.2ms 级）、缓存命中 Range 切片、带 Cookie 请求 `private/no-store` 不缓存、LRU 驱逐（1MB 预算下旧条目被逐出）
+- **磁盘缓存**：首次 `miss` 落盘 → 二次 `hit`（0.2ms 级，v3.0.2 起命中体与首次透传**逐字节比对一致**）、缓存命中 Range 切片（v3.0.2 起与上游原始切片逐字节一致）、带 Cookie 请求 `private/no-store` 不缓存、LRU 驱逐（1MB 预算下旧条目被逐出）
 - **Docker 登录链**：`/cr/docker/v2/auth` 换取 token、`/cr/ghcr/v2/auth`、非法 scope `400`、裸 `/v2/auth` `400`、manifest 匿名 token 链 `200`、对拒绝资源返回指向本实例的合成 401 挑战
 - **AI 前缀**：`/ip/openrouter/api/v1/models` 200；`/ip/openai` 错误体原样透传（无包装）；POST 透传
 - **HF 协议**：`/hf/api/models` 200

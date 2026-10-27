@@ -78,6 +78,12 @@ var errUnsupportedRegistry error = authTargetError{}
 // handleDockerAuth implements the /v2/auth endpoint. localError is the
 // caller's locally-generated-response writer so error replies carry the
 // same global header set as every other response.
+//
+// Error semantics mirror the original flow, where every failure inside
+// handleDockerAuth (unreachable registry, malformed challenge, unreachable
+// token service, unconstructible fetch URL) propagates to the top-level
+// catch and surfaces as the plain-text 500 "Internal Server Error"
+// contract; only the explicit resolveDockerAuthTarget rejection maps to 400.
 func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path string, traits Traits, localError func(Traits, string, int)) {
 	key, scope, err := resolveDockerAuthTarget(path, r.URL.Query().Get("scope"))
 	if err != nil {
@@ -89,12 +95,14 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	// 1. Probe the upstream /v2/ endpoint for its auth challenge.
 	v2req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream+"/v2/", nil)
 	if err != nil {
-		localError(traits, "Invalid upstream request", http.StatusBadRequest)
+		// Original: new URL(upstreamUrl + '/v2/') throwing → top-level catch → 500.
+		localError(traits, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	v2resp, err := h.client.Do(v2req) // follows redirects, like the original
 	if err != nil {
-		localError(traits, "Registry unreachable", http.StatusBadGateway)
+		// Original: the fetch throws → top-level catch → 500.
+		localError(traits, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
@@ -131,7 +139,10 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	}
 	challenge, err := platform.ParseAuthenticate(authStr)
 	if err != nil {
-		forward(v2resp)
+		// Original: parseAuthenticate throws → top-level catch → 500.
+		_, _ = io.Copy(io.Discard, io.LimitReader(v2resp.Body, 64<<10))
+		v2resp.Body.Close()
+		localError(traits, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(v2resp.Body, 64<<10))
@@ -140,7 +151,9 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	// 2. Relay the client's credentials to the upstream token service.
 	treq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, challenge.TokenURL(scope), nil)
 	if err != nil {
-		localError(traits, "Invalid token request", http.StatusBadRequest)
+		// Original: new URL(realm) throwing inside fetchToken → top-level
+		// catch → 500.
+		localError(traits, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	if auth := r.Header.Get("Authorization"); auth != "" {
@@ -148,7 +161,8 @@ func (h *Handler) handleDockerAuth(w http.ResponseWriter, r *http.Request, path 
 	}
 	tres, err := h.client.Do(treq)
 	if err != nil {
-		localError(traits, "Token service unreachable", http.StatusBadGateway)
+		// Original: the token fetch throws → top-level catch → 500.
+		localError(traits, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	forward(tres)

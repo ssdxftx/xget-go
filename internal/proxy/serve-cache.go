@@ -103,7 +103,7 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	h.emitMetrics(w, r, Traits{}, key, start, 0, 0, "hit")
 
 	isHEAD := r.Method == http.MethodHead
-	body, err := entry.OpenBody()
+	body, bodyStart, err := entry.OpenBody()
 	if err != nil {
 		// Entry vanished between Get and open; no upstream fallback here.
 		security.WriteError(w, r, "Cached resource unavailable", http.StatusBadGateway, false)
@@ -122,7 +122,9 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 		hdr.Set("Content-Range", cache.FormatRange(start64, end64, entry.Size))
 		hdr.Set("Content-Length", strconv.FormatInt(end64-start64+1, 10))
 		w.WriteHeader(http.StatusPartialContent)
-		if _, err := body.Seek(start64, io.SeekStart); err == nil {
+		// Seeks are absolute: offset by the JSON preamble length that
+		// OpenBody reports as the body start.
+		if _, err := body.Seek(bodyStart+start64, io.SeekStart); err == nil {
 			_, _ = io.CopyN(w, body, end64-start64+1)
 		}
 		return

@@ -107,19 +107,26 @@ func (h *Handler) methodAllowed(traits Traits) []string {
 
 // ServeHTTP implements the full request pipeline.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Track write state so a recovered panic can still emit the same 500
-	// JSON contract the original produces via its top-level try/catch.
+	start := time.Now()
+
+	// Track write state so a recovered panic can still emit the same
+	// plain-text 500 the original produces via its top-level try/catch.
 	sw := &statusWriter{ResponseWriter: w}
+	var detected Traits // captured so the panic path mirrors the official
+	// performance-header gate (protocol requests get no perf header).
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("panic recovered: %v\n%s", rec, debug.Stack())
 			if !sw.wrote {
-				security.WriteError(sw, r, "Internal Server Error", http.StatusInternalServerError, true)
+				// The official top-level catch emits
+				// createErrorResponse('Internal Server Error', 500)
+				// WITHOUT the JSON-details flag: a plain-text body.
+				security.AddCorsHeaders(sw.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+				h.emitMetrics(sw, r, detected, "", start, 0, 0, "none")
+				security.WriteError(sw, r, "Internal Server Error", http.StatusInternalServerError, false)
 			}
 		}
 	}()
-
-	start := time.Now()
 
 	// Liveness probe is always open.
 	if r.URL.Path == "/healthz" {
@@ -129,7 +136,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v := newView(r)
-	traits := Detect(v)
+	detected = Detect(v)
+	traits := detected
 	path := v.Path
 
 	// Locally generated responses all carry the header set the original
@@ -314,33 +322,42 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		}
 	}()
 
-	// Error wrapping: standard requests get the JSON contract; docker 401s
-	// without a challenge hint at private repositories — unless the registry
-	// already answered with its own JSON UNAUTHORIZED error (official
-	// isCustomError branch), which passes through untouched. Git/LFS/AI/HF
-	// errors pass through untouched.
-	if !up.local && resp.StatusCode >= 400 {
+	// Error wrapping: port of finalizeErrorResponse. The official gate is
+	// "not ok" (anything outside 2xx — the extra 206 check there is
+	// redundant because 206 is already ok). Docker 401s get the
+	// private-repository hint unless the registry already answered with
+	// its own JSON UNAUTHORIZED error (official isCustomError branch);
+	// 401s WITH a WWW-Authenticate challenge (our synthesized
+	// responseUnauthorized) pass through untouched. Git/LFS/AI/HF errors
+	// pass through untouched. Everything else — standard platforms AND
+	// docker non-401 errors (404/429/5xx/...) alike — gets the JSON
+	// error contract with the status preserved.
+	if !up.local && !(resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		switch {
-		case !traits.IsProtocol():
+		case traits.Docker && resp.StatusCode == http.StatusUnauthorized:
+			if resp.Header.Get("WWW-Authenticate") == "" {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+				resp.Body.Close() // fully consumed up to the cap; drop the rest
+				if resp.Header.Get("Content-Type") == "application/json" &&
+					strings.Contains(string(body), "UNAUTHORIZED") {
+					// Registry's own JSON error: relay as-is.
+					resp.Body = io.NopCloser(bytes.NewReader(body))
+				} else {
+					resp = security.BuildErrorResponse(
+						fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
+						resp.StatusCode, true)
+					up.local = true
+				}
+			}
+		case traits.Git || traits.GitLFS || traits.AI || traits.HF:
+			// Protocol errors relay raw (official early return).
+		default:
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-			resp.Body.Close() // fully consumed up to the cap; drop the rest
+			resp.Body.Close()
 			resp = security.BuildErrorResponse(
 				fmt.Sprintf("Upstream server error (%d): %s", resp.StatusCode, string(body)),
 				resp.StatusCode, true)
 			up.local = true
-		case traits.Docker && resp.StatusCode == http.StatusUnauthorized && resp.Header.Get("WWW-Authenticate") == "":
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-			resp.Body.Close()
-			if resp.Header.Get("Content-Type") == "application/json" &&
-				strings.Contains(string(body), "UNAUTHORIZED") {
-				// Registry's own JSON error: relay as-is.
-				resp.Body = io.NopCloser(bytes.NewReader(body))
-			} else {
-				resp = security.BuildErrorResponse(
-					fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
-					resp.StatusCode, true)
-				up.local = true
-			}
 		}
 	}
 
