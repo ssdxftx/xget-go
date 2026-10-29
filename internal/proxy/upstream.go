@@ -9,6 +9,9 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -55,8 +58,10 @@ var hopResponseHeaders = map[string]bool{
 }
 
 // maxBodyBuffer caps how much of an incoming request body is buffered so
-// that retries can replay it (git packs, docker pushes).
-const maxBodyBuffer = 32 << 20 // 32 MiB
+// that retries can replay it. Bodies above the cap stream through without
+// retry, which keeps the per-request memory footprint bounded (a 32 MiB
+// buffer multiplied by concurrent uploads was a memory-exhaustion vector).
+const maxBodyBuffer = 1 << 20 // 1 MiB
 
 // upstreamResult carries the final upstream response plus metrics.
 type upstreamResult struct {
@@ -300,12 +305,17 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		}
 		r.Body = &cancelBody{ReadCloser: r.Body, cancel: cancel}
 
-		if traits.Docker {
-			var redirFailed bool
+		if traits.Docker && redirectStatus(r.StatusCode) && r.Header.Get("Location") != "" {
+			var redirFailed, redirTimedOut bool
 			// Use the parent request context: closing the 3xx body cancels
 			// the per-attempt context (cancelBody), so resp.Request.Context()
-			// is already dead by the time the redirect request is built.
-			r, redirFailed = h.followDockerRedirect(in.Context(), r, baseHeaders, body)
+			// is already dead by the time the redirect request is built. A
+			// fresh headers-only timeout keeps the redirect covered by
+			// TIMEOUT_SECONDS.
+			r, redirFailed, redirTimedOut = h.followDockerRedirectTimed(in.Context(), r, baseHeaders, body)
+			if redirTimedOut {
+				return localTextResult(in.Context(), "Request timeout", http.StatusRequestTimeout)
+			}
 			if redirFailed {
 				// Same contract as a fetch exception while chasing a
 				// registry redirect: retry, then 502 on the final try.
@@ -429,6 +439,35 @@ func (h *Handler) followDockerRedirect(ctx context.Context, resp *http.Response,
 	return followed, false
 }
 
+// followDockerRedirectTimed wraps followDockerRedirect with a headers-only
+// timeout. The timer is stopped once headers arrive; the cancel func is tied
+// to the returned body so streaming stays unbounded. The third return value
+// reports a timeout (the original surfaces it as a 408 from the top-level
+// AbortError catch).
+func (h *Handler) followDockerRedirectTimed(parent context.Context, resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool, bool) {
+	ctx, cancel := context.WithCancel(parent)
+	var fired atomic.Bool
+	timer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
+		fired.Store(true)
+		cancel()
+	})
+	followed, failed := h.followDockerRedirect(ctx, resp, headers, body)
+	timer.Stop()
+	if fired.Load() || (ctx.Err() != nil && !failed) {
+		if followed != nil && followed.Body != nil {
+			followed.Body.Close()
+		}
+		cancel()
+		return nil, true, true
+	}
+	if failed {
+		cancel()
+		return nil, true, false
+	}
+	followed.Body = &cancelBody{ReadCloser: followed.Body, cancel: cancel}
+	return followed, false, false
+}
+
 // dockerAnonymousRetry answers a registry 401 challenge by fetching an
 // anonymous pull token and retrying once (port of retryDockerWithAnonymousToken).
 // On failure a synthesized 401 is returned whose realm points at this
@@ -483,15 +522,34 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 	}
 	req.Header = hdr
 
-	retryResp, err := h.dockerClient.Do(req)
+	// The retry fetch keeps the original headers-only timeout (the official
+	// reuses the attempt's AbortSignal). A timeout falls back to the 401
+	// challenge, matching the inner try/catch of retryDockerWithAnonymousToken.
+	retryCtx, retryCancel := context.WithCancel(ctx)
+	var retryFired atomic.Bool
+	retryTimer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
+		retryFired.Store(true)
+		retryCancel()
+	})
+	retryResp, err := h.dockerClient.Do(req.WithContext(retryCtx))
+	retryTimer.Stop()
 	if err != nil {
+		retryCancel()
 		return deny()
 	}
-	// followDockerRedirect returns (nil, true) when the redirect chase fails;
-	// the original catches that exception and falls back to the 401 challenge.
-	retryResp, redirFailed := h.followDockerRedirect(ctx, retryResp, hdr, body)
-	if redirFailed {
+	if retryFired.Load() || retryCtx.Err() != nil {
+		retryResp.Body.Close()
+		retryCancel()
 		return deny()
+	}
+	retryResp.Body = &cancelBody{ReadCloser: retryResp.Body, cancel: retryCancel}
+
+	if redirectStatus(retryResp.StatusCode) && retryResp.Header.Get("Location") != "" {
+		var redirFailed bool
+		retryResp, redirFailed, _ = h.followDockerRedirectTimed(ctx, retryResp, hdr, body)
+		if redirFailed {
+			return deny()
+		}
 	}
 	if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 		challenge.Body.Close()
@@ -521,10 +579,53 @@ func readRegistryToken(r io.Reader) string {
 	return ""
 }
 
+// readErrorBody reads an upstream error body and decodes gzip/deflate content
+// encodings before the text is embedded in the JSON error contract. Go's
+// Transport does not auto-decompress when the caller sets Accept-Encoding, so
+// without this step a compressed error page becomes binary garbage. The second
+// return value reports whether decoding was applied.
+func readErrorBody(resp *http.Response, limit int64) (string, bool) {
+	if resp == nil || resp.Body == nil {
+		return "", false
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	switch enc {
+	case "", "identity":
+		return string(raw), false
+	case "gzip", "x-gzip":
+		if zr, err := gzip.NewReader(bytes.NewReader(raw)); err == nil {
+			defer zr.Close()
+			if dec, err := io.ReadAll(io.LimitReader(zr, limit)); err == nil {
+				return string(dec), true
+			}
+		}
+	case "deflate":
+		if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+			defer zr.Close()
+			if dec, err := io.ReadAll(io.LimitReader(zr, limit)); err == nil {
+				return string(dec), true
+			}
+		}
+		fr := flate.NewReader(bytes.NewReader(raw))
+		defer fr.Close()
+		if dec, err := io.ReadAll(io.LimitReader(fr, limit)); err == nil {
+			return string(dec), true
+		}
+	}
+	// Unsupported encoding (e.g. br) or a corrupt compressed body: embedding
+	// the raw bytes would corrupt the JSON contract, so omit the body text.
+	return "", false
+}
+
 // probeHEADContentLength backfills Content-Length on HEAD responses that
 // lack it, using a single-byte Range probe (port of the HEAD fallback in
 // executeFetch).
 func (h *Handler) probeHEADContentLength(ctx context.Context, targetURL string, headers http.Header) string {
+	// The probe is optional: bound it so a hanging upstream cannot stall a
+	// HEAD request past the configured per-attempt timeout.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(h.cfg.TimeoutSecond)*time.Second)
+	defer cancel()
 	hdr := headers.Clone()
 	hdr.Set("Range", "bytes=0-0")
 	hdr.Set("Accept-Encoding", "identity")

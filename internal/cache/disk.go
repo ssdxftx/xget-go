@@ -1,8 +1,8 @@
 // Package cache implements the disk-backed response store that replaces the
 // original project's Cloudflare Cache API edge cache. Entries are keyed by
-// the canonical upstream GET URL, stored as body + sidecar metadata files,
-// expired per the cache-policy TTL classes and evicted LRU-style when the
-// total size budget is exceeded.
+// the canonical upstream GET URL, stored as a versioned body file plus an
+// atomically-replaced metadata sidecar, expired per the cache-policy TTL
+// classes and evicted LRU-style when the total size budget is exceeded.
 //
 // Xget-Go - a single-binary port of xixu-me/Xget (AGPL-3.0-or-later).
 package cache
@@ -36,8 +36,10 @@ type Store struct {
 	maxBytes int64
 	maxFile  int64
 
-	mu       sync.Mutex
-	total    int64
+	mu      sync.Mutex // guards total
+	total   int64
+	evictMu sync.Mutex // serializes Commit/evict/removal size accounting
+
 	disabled bool
 }
 
@@ -47,6 +49,10 @@ type Entry struct {
 	Header http.Header
 	Body   string // file path
 	Size   int64
+	// Legacy marks entries written by older versions that stored a JSON
+	// metadata preamble line at the start of the body file. New entries keep
+	// the body raw and write the metadata to a separate sidecar.
+	Legacy bool
 }
 
 type meta struct {
@@ -54,7 +60,9 @@ type meta struct {
 	Header map[string][]string `json:"header"`
 	Expiry int64               `json:"expiry"` // unix seconds
 	Size   int64               `json:"size"`
-	Access int64               `json:"access"` // unix seconds, LRU clock
+	// Body is the body file name inside the shard directory. Empty for legacy
+	// entries, which used <key>.body with an inline metadata preamble.
+	Body string `json:"body,omitempty"`
 }
 
 // Key derives the cache key from the canonical upstream URL.
@@ -82,14 +90,44 @@ func Open(dir string, maxTotalMB, maxFileMB int) *Store {
 	}
 	_ = os.MkdirAll(dir, 0o755)
 	s.total = s.audit()
+	// Trim a pre-existing over-budget cache at startup; Commit only evicts
+	// when new entries arrive.
+	s.evict("")
 	return s
 }
 
-// Enabled reports whether the store accepts entries.
-func (s *Store) Enabled() bool { return s != nil && !s.disabled }
+// Enabled reports whether the store accepts entries. A zero-value Store has
+// no directory and is treated as disabled so it can never write into the
+// process working directory.
+func (s *Store) Enabled() bool { return s != nil && !s.disabled && s.dir != "" }
 
-// audit recomputes the total size and drops corrupt/partial files.
+func (s *Store) shardDir(key string) string {
+	return filepath.Join(s.dir, key[:2])
+}
+
+func (s *Store) metaPath(key string) string {
+	return filepath.Join(s.shardDir(key), key+".meta")
+}
+
+func (s *Store) legacyBodyPath(key string) string {
+	return filepath.Join(s.shardDir(key), key+".body")
+}
+
+// bodyPath resolves the body file for an entry. Legacy entries have no Body
+// field and use the fixed <key>.body name. The Body value must be a plain file
+// name; a tampered sidecar cannot point outside the shard directory.
+func (s *Store) bodyPath(key string, m meta) string {
+	if m.Body != "" && m.Body != "." && m.Body != ".." && filepath.Base(m.Body) == m.Body {
+		return filepath.Join(s.shardDir(key), m.Body)
+	}
+	return s.legacyBodyPath(key)
+}
+
+// audit recomputes the total size, drops corrupt/partial entries and removes
+// orphan body files (e.g. left behind by a crash between body create and the
+// metadata commit).
 func (s *Store) audit() int64 {
+	referenced := make(map[string]bool)
 	var total int64
 	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -99,24 +137,37 @@ func (s *Store) audit() int64 {
 			_ = os.Remove(path)
 			return nil
 		}
-		if strings.HasSuffix(path, ".meta") {
-			var m meta
-			if raw, err := os.ReadFile(path); err == nil &&
-				json.Unmarshal(raw, &m) == nil && m.Size >= 0 {
-				total += m.Size
-				return nil
-			}
+		if !strings.HasSuffix(path, ".meta") {
+			return nil
+		}
+		key := strings.TrimSuffix(filepath.Base(path), ".meta")
+		raw, rerr := os.ReadFile(path)
+		var m meta
+		if rerr != nil || json.Unmarshal(raw, &m) != nil || m.Size < 0 {
 			_ = os.Remove(path)
-			_ = os.Remove(strings.TrimSuffix(path, ".meta") + ".body")
+			_ = os.Remove(s.legacyBodyPath(key))
+			return nil
+		}
+		bp := s.bodyPath(key, m)
+		if _, statErr := os.Stat(bp); statErr != nil {
+			_ = os.Remove(path)
+			_ = os.Remove(bp)
+			return nil
+		}
+		referenced[bp] = true
+		total += m.Size
+		return nil
+	})
+	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".body") && !referenced[path] {
+			_ = os.Remove(path)
 		}
 		return nil
 	})
 	return total
-}
-
-func (s *Store) paths(key string) (string, string) {
-	sub := filepath.Join(s.dir, key[:2])
-	return filepath.Join(sub, key+".body"), filepath.Join(sub, key+".meta")
 }
 
 // Get returns a fresh entry or nil (miss/expired/corrupt).
@@ -124,49 +175,73 @@ func (s *Store) Get(key string) *Entry {
 	if !s.Enabled() {
 		return nil
 	}
-	bodyPath, metaPath := s.paths(key)
+	metaPath := s.metaPath(key)
 	raw, err := os.ReadFile(metaPath)
 	if err != nil {
 		return nil
 	}
 	var m meta
 	if json.Unmarshal(raw, &m) != nil || m.Size < 0 {
-		_ = os.Remove(metaPath)
-		_ = os.Remove(bodyPath)
+		// Corrupt sidecar: drop it and the legacy body (a versioned body, if
+		// any, is cleaned up by the next audit's orphan pass).
+		s.drop(metaPath, s.legacyBodyPath(key), 0)
 		return nil
 	}
+	bodyPath := s.bodyPath(key, m)
 	if time.Now().Unix() >= m.Expiry {
-		_ = os.Remove(metaPath)
-		_ = os.Remove(bodyPath)
+		s.drop(metaPath, bodyPath, m.Size)
 		return nil
 	}
 	if _, err := os.Stat(bodyPath); err != nil {
-		_ = os.Remove(metaPath)
+		s.drop(metaPath, bodyPath, m.Size)
 		return nil
 	}
-	// LRU touch: rewrite the small sidecar with a new clock (best-effort).
-	m.Access = time.Now().Unix()
-	if updated, err := json.Marshal(m); err == nil {
-		_ = os.WriteFile(metaPath, updated, 0o644)
-	}
+	// LRU clock lives on the sidecar mtime; touching it never rewrites the
+	// JSON, so a concurrent read can never observe a partially written sidecar.
+	now := time.Now()
+	_ = os.Chtimes(metaPath, now, now)
 	h := http.Header{}
 	for k, vv := range m.Header {
 		for _, v := range vv {
 			h.Add(k, v)
 		}
 	}
-	return &Entry{Status: m.Status, Header: h, Body: bodyPath, Size: m.Size}
+	return &Entry{Status: m.Status, Header: h, Body: bodyPath, Size: m.Size, Legacy: m.Body == ""}
+}
+
+// drop removes an entry's files and subtracts its size from the running total.
+func (s *Store) drop(metaPath, bodyPath string, size int64) {
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	_ = os.Remove(metaPath)
+	if bodyPath != "" {
+		_ = os.Remove(bodyPath)
+	}
+	if size > 0 {
+		s.mu.Lock()
+		s.total -= size
+		if s.total < 0 {
+			s.total = 0
+		}
+		s.mu.Unlock()
+	}
 }
 
 // Writer streams a response body into the cache while the same bytes go to
 // the client (tee). A nil *Writer is a safe no-op.
 type Writer struct {
-	s    *Store
-	key  string
-	f    *os.File
-	size int64
-	over bool
-	done bool
+	s        *Store
+	key      string
+	bodyName string
+	bodyPath string
+	f        *os.File
+	size     int64
+	over     bool
+	done     bool
+
+	status int
+	header http.Header
+	expiry int64
 }
 
 // Begin starts a cache write for key with the given status/headers/TTL.
@@ -175,12 +250,15 @@ func (s *Store) Begin(key string, status int, header http.Header, ttlSeconds int
 	if !s.Enabled() {
 		return nil
 	}
-	bodyPath, _ := s.paths(key)
-	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
+	dir := s.shardDir(key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil
 	}
-	tmp := bodyPath + "." + randSuffix() + ".tmp"
-	f, err := os.Create(tmp)
+	// Versioned body name: a refresh writes a new file, so readers holding the
+	// previous metadata keep a consistent body until the sidecar is replaced.
+	bodyName := key + "." + randSuffix() + ".body"
+	bodyPath := filepath.Join(dir, bodyName)
+	f, err := os.Create(bodyPath)
 	if err != nil {
 		return nil
 	}
@@ -193,14 +271,10 @@ func (s *Store) Begin(key string, status int, header http.Header, ttlSeconds int
 			hdr.Add(k, v)
 		}
 	}
-	m := meta{Status: status, Header: hdr, Expiry: time.Now().Unix() + int64(ttlSeconds)}
-	raw, _ := json.Marshal(m)
-	if _, err := f.Write(append(raw, '\n')); err != nil { // preamble line
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return nil
+	return &Writer{
+		s: s, key: key, bodyName: bodyName, bodyPath: bodyPath, f: f,
+		status: status, header: hdr, expiry: time.Now().Unix() + int64(ttlSeconds),
 	}
-	return &Writer{s: s, key: key, f: f}
 }
 
 var hopByHop = map[string]bool{
@@ -252,46 +326,60 @@ func (w *Writer) Commit() {
 		return
 	}
 	w.done = true
-	if w.size == 0 {
-		w.teardown()
-		return
-	}
 	if err := w.f.Sync(); err != nil {
 		w.teardown()
 		return
 	}
-	tmp := w.f.Name()
 	if err := w.f.Close(); err != nil {
-		_ = os.Remove(tmp)
+		w.f = nil
+		w.teardown()
 		return
 	}
-	bodyPath, metaPath := w.s.paths(w.key)
-	if err := os.Rename(tmp, bodyPath); err != nil {
-		_ = os.Remove(tmp)
-		return
+	w.f = nil
+
+	w.s.evictMu.Lock()
+	defer w.s.evictMu.Unlock()
+
+	metaPath := w.s.metaPath(w.key)
+	// Read the previous sidecar (if any) so the refresh replaces its size and
+	// removes the superseded body file instead of leaving an orphan behind.
+	oldBodyPath := ""
+	oldSize := int64(0)
+	if rawOld, err := os.ReadFile(metaPath); err == nil {
+		var om meta
+		if json.Unmarshal(rawOld, &om) == nil {
+			oldSize = om.Size
+			oldBodyPath = w.s.bodyPath(w.key, om)
+		}
 	}
-	// Read the preamble meta back (first JSON line of the body file).
-	f, err := os.Open(bodyPath)
+
+	m := meta{Status: w.status, Header: w.header, Expiry: w.expiry, Size: w.size, Body: w.bodyName}
+	raw, err := json.Marshal(m)
 	if err != nil {
-		_ = os.Remove(bodyPath)
+		_ = os.Remove(w.bodyPath)
 		return
 	}
-	var m meta
-	err = json.NewDecoder(f).Decode(&m)
-	f.Close()
-	if err != nil || m.Status == 0 {
-		_ = os.Remove(bodyPath)
+	if err := writeFileAtomic(metaPath, raw); err != nil {
+		_ = os.Remove(w.bodyPath)
 		return
 	}
-	m.Size = w.size
-	m.Access = time.Now().Unix()
-	raw, _ := json.Marshal(m)
-	if err := os.WriteFile(metaPath, raw, 0o644); err != nil {
-		_ = os.Remove(bodyPath)
-		return
+
+	if oldBodyPath != "" && oldBodyPath != w.bodyPath {
+		_ = os.Remove(oldBodyPath)
 	}
-	w.s.addSize(w.size)
-	w.s.evict(w.key)
+	// Update the running total incrementally (Commits are serialized by
+	// evictMu) and only pay for the directory walk when the budget is
+	// actually exceeded.
+	w.s.mu.Lock()
+	w.s.total += w.size - oldSize
+	if w.s.total < 0 {
+		w.s.total = 0
+	}
+	over := w.s.total > w.s.maxBytes
+	w.s.mu.Unlock()
+	if over {
+		w.s.evictLocked(w.key)
+	}
 }
 
 // Abort discards the partial entry.
@@ -305,28 +393,38 @@ func (w *Writer) Abort() {
 
 func (w *Writer) teardown() {
 	if w.f != nil {
-		name := w.f.Name()
 		_ = w.f.Close()
-		_ = os.Remove(name)
 		w.f = nil
+	}
+	if w.bodyPath != "" {
+		_ = os.Remove(w.bodyPath)
 	}
 }
 
-func (s *Store) addSize(n int64) {
-	s.mu.Lock()
-	s.total += n
-	s.mu.Unlock()
+// writeFileAtomic writes data to path via a temporary file + rename so a
+// concurrent reader never observes a partially written sidecar.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + "." + randSuffix() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // evict drops least-recently-used entries until the budget is met.
 func (s *Store) evict(protect string) {
-	s.mu.Lock()
-	total := s.total
-	s.mu.Unlock()
-	if total <= s.maxBytes {
-		return
-	}
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	s.evictLocked(protect)
+}
 
+// evictLocked assumes evictMu is held. It recomputes the total from disk so
+// drift from overwrites, expiries or partial failures cannot accumulate.
+func (s *Store) evictLocked(protect string) {
 	type item struct {
 		key    string
 		metaP  string
@@ -335,12 +433,17 @@ func (s *Store) evict(protect string) {
 		access int64
 	}
 	var items []item
+	var total int64
 	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".meta") {
 			return nil
 		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
 			return nil
 		}
 		var m meta
@@ -348,9 +451,23 @@ func (s *Store) evict(protect string) {
 			return nil
 		}
 		key := strings.TrimSuffix(filepath.Base(path), ".meta")
-		items = append(items, item{key, path, strings.TrimSuffix(path, ".meta") + ".body", m.Size, m.Access})
+		items = append(items, item{
+			key:    key,
+			metaP:  path,
+			bodyP:  s.bodyPath(key, m),
+			size:   m.Size,
+			access: info.ModTime().Unix(),
+		})
+		total += m.Size
 		return nil
 	})
+	s.mu.Lock()
+	s.total = total
+	s.mu.Unlock()
+	if total <= s.maxBytes {
+		return
+	}
+
 	sort.Slice(items, func(i, j int) bool { return items[i].access < items[j].access })
 
 	for _, it := range items {
@@ -370,15 +487,17 @@ func (s *Store) evict(protect string) {
 	s.mu.Unlock()
 }
 
-// OpenBody opens the cached body file positioned after the JSON preamble
-// line that Begin() writes ahead of the body bytes, ready to serve exactly
-// e.Size bytes. The second return value is the absolute file offset of the
-// body start (callers must add it when seeking for Range slices, because
-// seeks are absolute).
+// OpenBody opens the cached body file ready to serve exactly e.Size bytes.
+// The second return value is the absolute file offset of the body start;
+// callers must add it when seeking for Range slices. Legacy entries carry a
+// JSON metadata preamble line that must be skipped; new entries start at 0.
 func (e *Entry) OpenBody() (*os.File, int64, error) {
 	f, err := os.Open(e.Body)
 	if err != nil {
 		return nil, 0, err
+	}
+	if !e.Legacy {
+		return f, 0, nil
 	}
 	line, err := readFirstLine(f)
 	if err != nil {

@@ -240,6 +240,37 @@ func hasCacheControlDirective(cacheControl, directive string) bool {
 	return false
 }
 
+// safeVaryHeaders lists request headers that either the proxy does not forward
+// (Accept, Accept-Language), always fixes (User-Agent) or handles separately
+// (Range). A response that varies on anything else (notably Origin, which the
+// standard profile forwards) must not be shared between clients by the
+// URL-only disk cache.
+var safeVaryHeaders = map[string]bool{
+	"accept":          true,
+	"accept-encoding": true,
+	"accept-language": true,
+	"range":           true,
+	"user-agent":      true,
+}
+
+// responseVaryBypassesCache reports whether the upstream Vary header makes the
+// URL-only cache key unsafe. "*" and any header whose value can differ between
+// clients (Origin, Cookie, Authorization, custom headers) force a bypass.
+func responseVaryBypassesCache(h http.Header) bool {
+	for _, v := range h.Values("Vary") {
+		for _, part := range strings.Split(v, ",") {
+			name := strings.ToLower(strings.TrimSpace(part))
+			if name == "" {
+				continue
+			}
+			if name == "*" || !safeVaryHeaders[name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // resolveResponseCachePolicy ports resolveResponseCachePolicy: upstream
 // privacy directives downgrade the stored/emitted policy.
 func resolveResponseCachePolicy(base CachePolicy, upstreamHeader http.Header) CachePolicy {
@@ -253,12 +284,10 @@ func resolveResponseCachePolicy(base CachePolicy, upstreamHeader http.Header) Ca
 	if hasCacheControlDirective(cc, "no-store") || hasCacheControlDirective(cc, "no-cache") {
 		return CachePolicy{Mode: CacheBypass, NoStore: true}
 	}
-	for _, v := range upstreamHeader.Values("Vary") {
-		for _, part := range strings.Split(v, ",") {
-			if strings.TrimSpace(part) == "*" {
-				return CachePolicy{Mode: CacheBypass, NoStore: true}
-			}
-		}
+	// The disk cache is keyed by URL only, so it cannot honour Vary. Bypass
+	// storage for representations bound to a client-varying request header.
+	if responseVaryBypassesCache(upstreamHeader) {
+		return CachePolicy{Mode: CacheBypass, NoStore: true}
 	}
 	return base
 }

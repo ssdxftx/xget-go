@@ -55,6 +55,20 @@ func (sw *statusWriter) Write(p []byte) (int, error) {
 	return sw.ResponseWriter.Write(p)
 }
 
+// ReadFrom forwards to the underlying ResponseWriter so io.Copy can use its
+// sendfile-friendly fast path for large proxied downloads instead of falling
+// back to a 32 KiB userspace buffer.
+func (sw *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !sw.wrote {
+		sw.status = http.StatusOK
+		sw.wrote = true
+	}
+	if rf, ok := sw.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(sw.ResponseWriter, r)
+}
+
 // Flush forwards to the underlying writer so streaming responses (SSE/AI)
 // reach the client as chunks arrive instead of sitting in net/http's buffer.
 func (sw *statusWriter) Flush() {
@@ -331,7 +345,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// tryReadCachedResponse: protocol requests, sensitive headers and
 	// non-GET/HEAD never touch the cache).
 	if policy.Cacheable && r.Method == http.MethodGet {
-		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil {
+		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil && !responseVaryBypassesCache(entry.Header) {
 			// Byte-range slicing is only valid for identity-encoded bodies.
 			// A compressed entry (gzip/br/deflate) must not be sliced; skip
 			// the hit and refetch, because Range requests are sent upstream
@@ -343,10 +357,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					// the official cache_hit_full_content mark.
 					hitMark = "cache_hit_full_content"
 				}
-				h.serveFromCache(sw, r, entry, mon, hitMark)
-				log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
-					clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
-				return
+				if h.serveFromCache(sw, r, entry, mon, hitMark, false) {
+					log.Printf("%s %s%s ← cache [%s] status=%d size=%d",
+						clientIP(r), r.Method, r.URL.RequestURI(), keyOrDash(key), entry.Status, entry.Size)
+					return
+				}
+				// The entry vanished between Get and open: fall through to a
+				// fresh upstream fetch instead of surfacing a 502.
 			}
 		}
 	}
@@ -385,19 +402,26 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	// pass through untouched. Everything else — standard platforms AND
 	// docker non-401 errors (404/429/5xx/...) alike — gets the JSON
 	// error contract with the status preserved.
-	if !up.local && !(resp.StatusCode >= 200 && resp.StatusCode < 300) {
+	// 304 has no body and cannot carry the JSON contract, so it passes through
+	// untouched (the official Fetch Response constructor rejects a 304 body).
+	if !up.local && resp.StatusCode != http.StatusNotModified &&
+		!(resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		switch {
 		case traits.Docker && resp.StatusCode == http.StatusUnauthorized:
 			if resp.Header.Get("WWW-Authenticate") == "" {
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+				text, decoded := readErrorBody(resp, 64<<10)
 				resp.Body.Close() // fully consumed up to the cap; drop the rest
 				if resp.Header.Get("Content-Type") == "application/json" &&
-					strings.Contains(string(body), "UNAUTHORIZED") {
-					// Registry's own JSON error: relay as-is.
-					resp.Body = io.NopCloser(bytes.NewReader(body))
+					strings.Contains(text, "UNAUTHORIZED") {
+					// Registry's own JSON error: relay a valid (decoded) body.
+					resp.Body = io.NopCloser(strings.NewReader(text))
+					if decoded {
+						resp.Header.Del("Content-Encoding")
+					}
+					resp.Header.Set("Content-Length", strconv.Itoa(len(text)))
 				} else {
 					resp = security.BuildErrorResponse(
-						fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", string(body)),
+						fmt.Sprintf("Authentication required for this container registry resource. This may be a private repository. Original error: %s", text),
 						resp.StatusCode, true)
 					up.local = true
 				}
@@ -405,10 +429,10 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 		case traits.Git || traits.GitLFS || traits.AI || traits.HF:
 			// Protocol errors relay raw (official early return).
 		default:
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			text, _ := readErrorBody(resp, 64<<10)
 			resp.Body.Close()
 			resp = security.BuildErrorResponse(
-				fmt.Sprintf("Upstream server error (%d): %s", resp.StatusCode, string(body)),
+				fmt.Sprintf("Upstream server error (%d): %s", resp.StatusCode, text),
 				resp.StatusCode, true)
 			up.local = true
 		}
@@ -502,7 +526,9 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 	// (hasOriginBoundRewrite upstream).
 	var cacheWriter *cache.Writer
 	if !traits.IsProtocol() && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if originBoundRewrite {
+		// A sensitive request keeps its private policy even when the PyPI
+		// body is origin-bound; only downgrade a cacheable policy to bypass.
+		if originBoundRewrite && policy.Mode != CachePrivate {
 			policy = CachePolicy{Mode: CacheBypass, NoStore: true}
 			cacheStatus = string(policy.Mode)
 		}
@@ -570,6 +596,13 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 // spooled to a temp file so an over-cap cache entry can still be replayed in
 // full. Returns false only when spooling could not start (body untouched).
 func (h *Handler) serveRangeAfterFullCache(w http.ResponseWriter, r *http.Request, body io.Reader, cw *cache.Writer, cacheURL string, mon *performanceMonitor) bool {
+	// Bound the spool: a Range request against an upstream that ignores Range
+	// must not be able to fill the temp filesystem with the whole resource.
+	spoolCap := int64(h.cfg.CacheMaxFileMB) << 20
+	if spoolCap <= 0 || spoolCap > 64<<20 {
+		spoolCap = 64 << 20
+	}
+
 	tmp, err := os.CreateTemp("", "xget-range-*")
 	if err != nil {
 		return false
@@ -580,19 +613,47 @@ func (h *Handler) serveRangeAfterFullCache(w http.ResponseWriter, r *http.Reques
 		_ = os.Remove(name)
 	}()
 
-	_, copyErr := io.Copy(io.MultiWriter(tmp, cw), body)
-	if copyErr != nil {
+	limited := &io.LimitedReader{R: body, N: spoolCap + 1}
+	n, copyErr := io.Copy(io.MultiWriter(tmp, cw), limited)
+	overCap := n > spoolCap
+	if overCap || copyErr != nil {
 		cw.Abort()
+	} else {
+		cw.Commit()
 	}
-	cw.Commit()
 
-	if copyErr == nil {
+	if !overCap && copyErr == nil {
 		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil && cacheEntrySliceable(entry) {
-			mon.mark("range_cache_hit_after_full_cache")
-			clear(w.Header())
-			h.serveFromCache(w, r, entry, mon, "")
+			if h.serveFromCache(w, r, entry, mon, "range_cache_hit_after_full_cache", true) {
+				return true
+			}
+			// Entry vanished between Get and open: replay the spool below.
+		}
+	}
+
+	if overCap {
+		// Only the prefix was spooled: replay it and stream the remainder so
+		// the client still receives the complete 200 without unbounded disk.
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			return true
 		}
+		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+		h.emitMetrics(w, r, Traits{}, mon)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, tmp)
+		_, _ = io.Copy(w, body)
+		return true
+	}
+
+	if copyErr != nil {
+		// Upstream broke mid-body: mirror the rewrite path's plain-text 500
+		// instead of replaying a truncated 200 with the full Content-Length.
+		clear(w.Header())
+		security.AddSecurityHeaders(w.Header())
+		security.AddCorsHeaders(w.Header(), r, h.cfg.AllowedOrigins, h.cfg.AllowedMethods)
+		h.emitMetrics(w, r, Traits{}, mon)
+		security.WriteError(w, r, "Internal Server Error", http.StatusInternalServerError, false)
+		return true
 	}
 
 	// Entry not stored (cap/IO): replay the spooled full body unchanged.

@@ -194,11 +194,12 @@ func TransformPath(effectivePath, key string) string {
 	}
 
 	prefix := URLPrefix(key)
-	stripped := "/"
-	if len(effectivePath) > len(prefix) {
+	// Only strip when the canonical prefix actually matches. The resolve
+	// fallback also accepts the literal platform key (e.g. "/pypi-files");
+	// the original leaves such paths untouched instead of slicing by length.
+	stripped := effectivePath
+	if strings.HasPrefix(effectivePath, prefix) {
 		stripped = "/" + effectivePath[len(prefix):]
-	} else if len(effectivePath) >= len(prefix) {
-		stripped = "/"
 	}
 
 	switch key {

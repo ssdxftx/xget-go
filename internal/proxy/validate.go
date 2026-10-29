@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"xget/internal/config"
 )
@@ -54,7 +55,10 @@ func decodeTwice(p string) (string, bool) {
 			break
 		}
 		next, err := url.PathUnescape(decoded)
-		if err != nil {
+		if err != nil || !utf8.ValidString(next) {
+			// decodeURIComponent also rejects invalid UTF-8 byte sequences
+			// (e.g. overlong encodings of ".."), so fail closed like the
+			// original validation.
 			return "", false
 		}
 		decoded = next

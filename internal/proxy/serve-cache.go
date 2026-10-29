@@ -20,10 +20,12 @@ import (
 )
 
 // requestOrigin mirrors url.origin of the original implementation: the
-// client-facing scheme/host, honouring the reverse-proxy proto header.
+// client-facing scheme/host. X-Forwarded-Proto is only trusted when it is a
+// valid scheme; arbitrary client-supplied values must not leak into rewritten
+// bodies, cache keys or the synthesized 401 realm.
 func requestOrigin(r *http.Request) string {
-	scheme := r.Header.Get("X-Forwarded-Proto")
-	if scheme == "" {
+	scheme := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+	if scheme != "http" && scheme != "https" {
 		if r.TLS != nil {
 			scheme = "https"
 		} else {
@@ -92,9 +94,24 @@ func parseSingleRange(spec string, size int64) (start, end int64, ok bool) {
 }
 
 // serveFromCache writes a stored entry (full or 206 slice for GET Range,
-// headers-only for HEAD). mirrored from the Cloudflare cache.match flow.
-func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *cache.Entry, mon *performanceMonitor, hitMark string) {
+// headers-only for HEAD), mirroring the Cloudflare cache.match flow.
+//
+// It opens the body before touching the response headers and returns false
+// when the entry vanished between Get and open, so the caller can fall back to
+// a fresh upstream fetch instead of surfacing a 502. When replaceHeaders is
+// true the current header set is cleared after the body is opened (used by the
+// range-after-full-cache path, which pre-populated headers for the 200).
+func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *cache.Entry, mon *performanceMonitor, hitMark string, replaceHeaders bool) bool {
+	body, bodyStart, err := entry.OpenBody()
+	if err != nil {
+		return false
+	}
+	defer body.Close()
+
 	hdr := w.Header()
+	if replaceHeaders {
+		clear(hdr)
+	}
 	for k, vv := range entry.Header {
 		if hopResponseHeaders[strings.ToLower(k)] {
 			continue
@@ -113,21 +130,11 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 	h.emitMetrics(w, r, Traits{}, mon)
 
 	isHEAD := r.Method == http.MethodHead
-	body, bodyStart, err := entry.OpenBody()
-	if err != nil {
-		// Entry vanished between Get and open; no upstream fallback here.
-		// Drop the stored Content-Length so the error body is not framed
-		// with the full resource size.
-		hdr.Del("Content-Length")
-		security.WriteError(w, r, "Cached resource unavailable", http.StatusBadGateway, false)
-		return
-	}
-	defer body.Close()
 
 	if isHEAD {
 		hdr.Set("Content-Length", strconv.FormatInt(entry.Size, 10))
 		w.WriteHeader(entry.Status)
-		return
+		return true
 	}
 
 	spec := r.Header.Get("Range")
@@ -145,7 +152,7 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 		if _, err := body.Seek(bodyStart+start64, io.SeekStart); err == nil {
 			_, _ = io.CopyN(w, body, end64-start64+1)
 		}
-		return
+		return true
 	}
 	if spec != "" && strings.HasPrefix(spec, "bytes=") && rangeUnsatisfiable(spec, entry.Size) {
 		hdr.Set("Content-Range", fmt.Sprintf("bytes */%d", entry.Size))
@@ -153,23 +160,29 @@ func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, entry *
 		// is the short error message, so drop the stale length.
 		hdr.Del("Content-Length")
 		security.WriteError(w, r, "Requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable, false)
-		return
+		return true
 	}
 
 	hdr.Set("Content-Length", strconv.FormatInt(entry.Size, 10))
 	w.WriteHeader(entry.Status)
 	_, _ = io.Copy(w, body)
+	return true
 }
 
 // rangeUnsatisfiable reports whether every byte position lies past the end.
 func rangeUnsatisfiable(spec string, size int64) bool {
 	spec = strings.TrimPrefix(spec, "bytes=")
 	dash := strings.IndexByte(spec, '-')
-	if dash <= 0 {
+	if dash < 0 {
 		return false
 	}
-	a, err := strconv.ParseInt(strings.TrimSpace(spec[:dash]), 10, 64)
-	return err == nil && a >= size
+	a := strings.TrimSpace(spec[:dash])
+	if a == "" { // suffix range: bytes=-N
+		n, err := strconv.ParseInt(strings.TrimSpace(spec[dash+1:]), 10, 64)
+		return err == nil && n == 0
+	}
+	start, err := strconv.ParseInt(a, 10, 64)
+	return err == nil && start >= size
 }
 
 // responseUnauthorized builds the registry-style 401 challenge whose realm
