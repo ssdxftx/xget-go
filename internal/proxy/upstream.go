@@ -69,6 +69,7 @@ type upstreamResult struct {
 	local    bool // response was generated locally (timeout/failure)
 	attempts int
 	fetchMs  float64
+	deadline time.Time // headers deadline of the final attempt (HEAD probe)
 }
 
 // cancelBody couples the response body with the attempt context cancel func
@@ -199,9 +200,15 @@ func buildHeaders(in *http.Request, v *view, passthrough bool, targetURL string,
 		return h
 	}
 
-	// Standard acceleration profile (mirrors createFetchOptions).
+	// Standard acceleration profile (mirrors createFetchOptions). The client's
+	// Accept-Encoding is honoured: a client that only accepts identity must
+	// never receive a gzip/br body. The disk cache stores identity
+	// representations only (see finalize), so the URL-only cache stays safe.
 	h.Set("User-Agent", "Wget/1.21.3")
-	enc := "gzip, deflate, br"
+	enc := strings.TrimSpace(in.Header.Get("Accept-Encoding"))
+	if enc == "" {
+		enc = "identity"
+	}
 	rangeHeader := in.Header.Get("Range")
 	if rangeHeader != "" || mediaFilePattern.MatchString(targetURL) {
 		enc = "identity"
@@ -248,6 +255,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 
 	baseHeaders := buildHeaders(in, v, passthrough, targetURL, traits, key)
 	var resp *http.Response
+	var respDeadline time.Time
 	var actualAttempts int
 	var timerFired atomic.Bool
 	transportFailed := false
@@ -269,7 +277,8 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		// timer is stopped so multi-GB downloads stream without cutoff.
 		timerFired.Store(false)
 		attemptCtx, cancel := context.WithCancel(in.Context())
-		timer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
+		attemptDeadline := time.Now().Add(time.Duration(h.cfg.TimeoutSecond) * time.Second)
+		timer := time.AfterFunc(time.Until(attemptDeadline), func() {
 			timerFired.Store(true)
 			cancel()
 		})
@@ -309,10 +318,10 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 			var redirFailed, redirTimedOut bool
 			// Use the parent request context: closing the 3xx body cancels
 			// the per-attempt context (cancelBody), so resp.Request.Context()
-			// is already dead by the time the redirect request is built. A
-			// fresh headers-only timeout keeps the redirect covered by
-			// TIMEOUT_SECONDS.
-			r, redirFailed, redirTimedOut = h.followDockerRedirectTimed(in.Context(), r, baseHeaders, body)
+			// is already dead by the time the redirect request is built. The
+			// attempt deadline keeps the redirect within the same
+			// TIMEOUT_SECONDS budget as the original fetch.
+			r, redirFailed, redirTimedOut = h.followDockerRedirectTimed(in.Context(), attemptDeadline, r, baseHeaders, body)
 			if redirTimedOut {
 				return localTextResult(in.Context(), "Request timeout", http.StatusRequestTimeout)
 			}
@@ -330,12 +339,14 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		if (r.StatusCode >= 200 && r.StatusCode < 300) || r.StatusCode == http.StatusPartialContent {
 			mon.mark("success")
 			resp = r
+			respDeadline = attemptDeadline
 			break
 		}
 
 		if traits.Docker && r.StatusCode == http.StatusUnauthorized {
 			mon.mark("docker_auth_challenge")
-			resp = h.dockerAnonymousRetry(in.Context(), targetURL, key, effectivePath, baseHeaders, body, r, in)
+			resp = h.dockerAnonymousRetry(in.Context(), attemptDeadline, targetURL, key, effectivePath, baseHeaders, body, r, in)
+			respDeadline = attemptDeadline
 			if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				mon.mark("success")
 			}
@@ -345,6 +356,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		if r.StatusCode >= 400 && r.StatusCode < 500 {
 			mon.mark("client_error")
 			resp = r // client error: retrying will not help
+			respDeadline = attemptDeadline
 			break
 		}
 
@@ -359,9 +371,11 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 64<<10))
 			r.Body.Close()
 			resp = r
+			respDeadline = attemptDeadline
 			time.Sleep(time.Duration(h.cfg.RetryDelayMs*(attempt+1)) * time.Millisecond)
 		} else {
 			resp = r
+			respDeadline = attemptDeadline
 		}
 	}
 
@@ -377,6 +391,7 @@ func (h *Handler) fetchUpstream(in *http.Request, v *view, targetURL string, tra
 		resp:     resp,
 		attempts: actualAttempts,
 		fetchMs:  float64(time.Since(start).Microseconds()) / 1000.0,
+		deadline: respDeadline,
 	}
 }
 
@@ -439,15 +454,22 @@ func (h *Handler) followDockerRedirect(ctx context.Context, resp *http.Response,
 	return followed, false
 }
 
-// followDockerRedirectTimed wraps followDockerRedirect with a headers-only
-// timeout. The timer is stopped once headers arrive; the cancel func is tied
-// to the returned body so streaming stays unbounded. The third return value
-// reports a timeout (the original surfaces it as a 408 from the top-level
-// AbortError catch).
-func (h *Handler) followDockerRedirectTimed(parent context.Context, resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool, bool) {
+// followDockerRedirectTimed wraps followDockerRedirect with the attempt's
+// headers-only deadline. The timer is stopped once headers arrive; the cancel
+// func is tied to the returned body so streaming stays unbounded. The third
+// return value reports a timeout (the original surfaces it as a 408 from the
+// top-level AbortError catch).
+func (h *Handler) followDockerRedirectTimed(parent context.Context, deadline time.Time, resp *http.Response, headers http.Header, body *bodyProvider) (*http.Response, bool, bool) {
+	remaining := time.Until(deadline)
+	if deadline.IsZero() {
+		remaining = time.Duration(h.cfg.TimeoutSecond) * time.Second
+	}
+	if remaining <= 0 {
+		return nil, true, true
+	}
 	ctx, cancel := context.WithCancel(parent)
 	var fired atomic.Bool
-	timer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
+	timer := time.AfterFunc(remaining, func() {
 		fired.Store(true)
 		cancel()
 	})
@@ -473,7 +495,7 @@ func (h *Handler) followDockerRedirectTimed(parent context.Context, resp *http.R
 // On failure a synthesized 401 is returned whose realm points at this
 // instance's /cr/<reg>/v2/auth, so docker clients run their credential
 // flow through the login proxy (port of responseUnauthorized).
-func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effectivePath string,
+func (h *Handler) dockerAnonymousRetry(ctx context.Context, deadline time.Time, targetURL, key, effectivePath string,
 	headers http.Header, body *bodyProvider, challenge *http.Response, r *http.Request) *http.Response {
 
 	deny := func() *http.Response {
@@ -491,7 +513,14 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 	}
 	scope := platform.ScopeFromPath(key, effectivePath)
 
-	treq, err := http.NewRequestWithContext(ctx, http.MethodGet, ch.TokenURL(scope), nil)
+	// The token negotiation shares the attempt deadline: the official retry
+	// runs inside the same AbortSignal as the original fetch.
+	tokenCtx, tokenCancel := ctx, context.CancelFunc(func() {})
+	if !deadline.IsZero() {
+		tokenCtx, tokenCancel = context.WithDeadline(ctx, deadline)
+	}
+	defer tokenCancel()
+	treq, err := http.NewRequestWithContext(tokenCtx, http.MethodGet, ch.TokenURL(scope), nil)
 	if err != nil {
 		return deny()
 	}
@@ -522,12 +551,19 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 	}
 	req.Header = hdr
 
-	// The retry fetch keeps the original headers-only timeout (the official
-	// reuses the attempt's AbortSignal). A timeout falls back to the 401
-	// challenge, matching the inner try/catch of retryDockerWithAnonymousToken.
+	// The retry fetch keeps the remaining attempt budget (the official reuses
+	// the attempt's AbortSignal). A timeout falls back to the 401 challenge,
+	// matching the inner try/catch of retryDockerWithAnonymousToken.
+	remaining := time.Until(deadline)
+	if deadline.IsZero() {
+		remaining = time.Duration(h.cfg.TimeoutSecond) * time.Second
+	}
+	if remaining <= 0 {
+		return deny()
+	}
 	retryCtx, retryCancel := context.WithCancel(ctx)
 	var retryFired atomic.Bool
-	retryTimer := time.AfterFunc(time.Duration(h.cfg.TimeoutSecond)*time.Second, func() {
+	retryTimer := time.AfterFunc(remaining, func() {
 		retryFired.Store(true)
 		retryCancel()
 	})
@@ -546,7 +582,7 @@ func (h *Handler) dockerAnonymousRetry(ctx context.Context, targetURL, key, effe
 
 	if redirectStatus(retryResp.StatusCode) && retryResp.Header.Get("Location") != "" {
 		var redirFailed bool
-		retryResp, redirFailed, _ = h.followDockerRedirectTimed(ctx, retryResp, hdr, body)
+		retryResp, redirFailed, _ = h.followDockerRedirectTimed(ctx, deadline, retryResp, hdr, body)
 		if redirFailed {
 			return deny()
 		}
@@ -571,8 +607,16 @@ func readRegistryToken(r io.Reader) string {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return ""
 	}
-	for _, k := range []string{"token", "access_token"} {
-		if s, ok := parsed[k].(string); ok && s != "" {
+	// Official precedence: a present string "token" wins even when empty
+	// (the caller treats an empty token as unusable); only when it is absent
+	// or not a string does the parser fall back to "access_token".
+	if v, ok := parsed["token"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	if v, ok := parsed["access_token"]; ok {
+		if s, ok := v.(string); ok {
 			return s
 		}
 	}
@@ -621,10 +665,17 @@ func readErrorBody(resp *http.Response, limit int64) (string, bool) {
 // probeHEADContentLength backfills Content-Length on HEAD responses that
 // lack it, using a single-byte Range probe (port of the HEAD fallback in
 // executeFetch).
-func (h *Handler) probeHEADContentLength(ctx context.Context, targetURL string, headers http.Header) string {
-	// The probe is optional: bound it so a hanging upstream cannot stall a
-	// HEAD request past the configured per-attempt timeout.
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(h.cfg.TimeoutSecond)*time.Second)
+func (h *Handler) probeHEADContentLength(ctx context.Context, targetURL string, headers http.Header, deadline time.Time) string {
+	// The probe is optional: bound it by the remaining attempt budget so a
+	// HEAD request cannot take 2x TIMEOUT_SECONDS (main fetch + probe).
+	remaining := time.Until(deadline)
+	if deadline.IsZero() {
+		remaining = time.Duration(h.cfg.TimeoutSecond) * time.Second
+	}
+	if remaining <= 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	hdr := headers.Clone()
 	hdr.Set("Range", "bytes=0-0")

@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-v3.0.6}"
+VERSION="${1:-v3.0.7}"
 GO="${GO:-go}"
 command -v "$GO" >/dev/null 2>&1 || GO="/home/z/toolchain/go/bin/go"
 

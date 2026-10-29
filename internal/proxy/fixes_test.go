@@ -293,3 +293,153 @@ func TestInvalidForwardedProtoNotUsedInRewrite(t *testing.T) {
 		t.Fatalf("rewritten body = %q, want http://example.com/npm/foo", rec.Body.String())
 	}
 }
+
+// A standard request must forward the client's Accept-Encoding upstream and
+// never hand a compressed body to a client that asked for identity.
+func TestStandardRequestHonorsAcceptEncoding(t *testing.T) {
+	var seen []string
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			ae := r.Header.Get("Accept-Encoding")
+			seen = append(seen, ae)
+			w.Header().Set("Content-Type", "text/plain")
+			if strings.Contains(ae, "gzip") {
+				body := gzipString("compressed")
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body)
+				return
+			}
+			_, _ = io.WriteString(w, "plain")
+		})
+		return m
+	}())
+
+	identity := doGet(h, "/gist/ae-identity.txt", map[string]string{"Accept-Encoding": "identity"})
+	if enc := identity.Header().Get("Content-Encoding"); enc != "" || identity.Body.String() != "plain" {
+		t.Fatalf("identity client: encoding=%q body=%q", enc, identity.Body.String())
+	}
+	gz := doGet(h, "/gist/ae-gzip.txt", map[string]string{"Accept-Encoding": "gzip"})
+	if enc := gz.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("gzip client: encoding=%q, want gzip", enc)
+	}
+	none := doGet(h, "/gist/ae-none.txt", nil)
+	if enc := none.Header().Get("Content-Encoding"); enc != "" || none.Body.String() != "plain" {
+		t.Fatalf("no-AE client: encoding=%q body=%q", enc, none.Body.String())
+	}
+	want := []string{"identity", "gzip", "identity"}
+	if len(seen) != len(want) {
+		t.Fatalf("upstream Accept-Encoding = %v, want %v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("upstream Accept-Encoding = %v, want %v", seen, want)
+		}
+	}
+}
+
+// A compressed upstream response is forwarded but never stored: the URL-only
+// disk cache keeps identity representations only.
+func TestCompressedResponseIsNotCached(t *testing.T) {
+	hits := 0
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.Header().Set("Content-Type", "text/plain")
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				_, _ = w.Write(gzipString("compressed"))
+				return
+			}
+			_, _ = io.WriteString(w, "plain")
+		})
+		return m
+	}())
+
+	if rec := doGet(h, "/gist/nc.txt", map[string]string{"Accept-Encoding": "gzip"}); rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("prime encoding = %q, want gzip", rec.Header().Get("Content-Encoding"))
+	}
+	identity := doGet(h, "/gist/nc.txt", map[string]string{"Accept-Encoding": "identity"})
+	if enc := identity.Header().Get("Content-Encoding"); enc != "" || identity.Body.String() != "plain" {
+		t.Fatalf("identity after gzip: encoding=%q body=%q", enc, identity.Body.String())
+	}
+	if hits != 2 {
+		t.Fatalf("upstream hits = %d, want 2 (gzip response must not be cached)", hits)
+	}
+	cached := doGet(h, "/gist/nc.txt", nil)
+	if hits != 2 {
+		t.Fatalf("upstream hits after identity cache = %d, want 2", hits)
+	}
+	if !strings.Contains(cached.Header().Get("X-Performance-Metrics"), "cache_hit") {
+		t.Fatalf("third request metrics = %q, want cache_hit", cached.Header().Get("X-Performance-Metrics"))
+	}
+}
+
+// Legacy compressed cache entries are only served to clients that explicitly
+// accept the stored coding.
+func TestCacheEntryEncodingAcceptable(t *testing.T) {
+	gzipEntry := &cache.Entry{Header: http.Header{"Content-Encoding": []string{"gzip"}}}
+	identityReq := httptest.NewRequest("GET", "/", nil)
+	identityReq.Header.Set("Accept-Encoding", "identity")
+	if cacheEntryEncodingAcceptable(gzipEntry, identityReq) {
+		t.Fatal("gzip entry accepted for an identity client")
+	}
+	gzipReq := httptest.NewRequest("GET", "/", nil)
+	gzipReq.Header.Set("Accept-Encoding", "gzip, deflate")
+	if !cacheEntryEncodingAcceptable(gzipEntry, gzipReq) {
+		t.Fatal("gzip entry rejected for a gzip client")
+	}
+	plainEntry := &cache.Entry{Header: http.Header{}}
+	if !cacheEntryEncodingAcceptable(plainEntry, identityReq) {
+		t.Fatal("identity entry rejected for an identity client")
+	}
+}
+
+// A non-protocol 304 passes through without the JSON error contract, but it
+// still carries the security header set that every non-protocol response gets.
+func TestNonProtocol304KeepsSecurityHeaders(t *testing.T) {
+	h := testHandler(t, func() *http.ServeMux {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotModified)
+		})
+		return m
+	}())
+	h.cfg.MaxRetries = 1
+
+	rec := doGet(h, "/gist/file.txt", nil)
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", rec.Code)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("X-Frame-Options = %q, want DENY on a 304", got)
+	}
+	if got := rec.Header().Get("Strict-Transport-Security"); got == "" {
+		t.Fatal("missing HSTS on a non-protocol 304")
+	}
+}
+
+// The immutable-artifact checks must look at the target URL's pathname, not
+// the full URL (the npm tarball regex is anchored at the path start).
+func TestTargetPathnameEnablesAnchoredArtifactMatch(t *testing.T) {
+	if got := targetPathname("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?x=1#f"); got != "/pkg/-/pkg-1.0.0.tgz" {
+		t.Fatalf("targetPathname = %q", got)
+	}
+	if !isImmutableArtifactRequest("npm", "/other", "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz") {
+		t.Fatal("npm tarball in the target URL was not detected")
+	}
+}
+
+// A present-but-empty "token" wins over "access_token", matching the official
+// parser (the caller then treats the empty token as unusable).
+func TestReadRegistryTokenPrecedence(t *testing.T) {
+	if got := readRegistryToken(strings.NewReader(`{"token":"","access_token":"fallback"}`)); got != "" {
+		t.Fatalf("empty token should win over access_token, got %q", got)
+	}
+	if got := readRegistryToken(strings.NewReader(`{"access_token":"fallback"}`)); got != "fallback" {
+		t.Fatalf("access_token fallback = %q", got)
+	}
+}

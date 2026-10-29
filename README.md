@@ -4,7 +4,7 @@
 
 Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文件**：不依赖 Node.js、workerd 或任何运行时，拷贝到服务器即可运行。它为代码托管平台、AI 模型仓库、包管理器和容器镜像仓库提供统一的下载/拉取加速入口，**URL 结构与官方 Xget 完全同构**，客户端配置可直接沿用官方生态的既有约定。
 
-当前版本：**v3.0.6**（对齐上游 `0595fad`）。
+当前版本：**v3.0.7**（对齐上游 `0595fad`）。
 
 核心亮点：
 
@@ -48,7 +48,7 @@ Xget-Go 将 Xget 的核心加速能力编译为一个 **约 6 MB 的静态单文
 | Git LFS | `/info/lfs`、`objects/batch`、SHA-256 对象路径识别与透传 |
 | Docker Registry v2 | 17 家容器仓库加速，支持 `daemon.json` 镜像源配置，匿名 token 自动重试 |
 | Docker 私有仓库登录链 | `/v2/auth` 完整实现：`docker login` 走本实例完成凭证交换，支持私有镜像 |
-| AI 推理代理 | 28 家 `ip-*` 前缀（OpenAI/Anthropic/Gemini/Groq…），POST/流式响应原样透传 |
+| AI 推理代理 | 29 家 `ip-*` 前缀（OpenAI/Anthropic/Gemini/Groq…），POST/流式响应原样透传 |
 | Hugging Face API | `/hf/api`、`/hf/token` 协议级透传，`Authorization` 保留 |
 | 内容改写 | PyPI 索引页、npm 元数据、Flatpak 描述文件中的上游链接自动改写回本实例 |
 | 磁盘缓存层 | 对齐官方三级 TTL 策略（immutable 86400s / metadata 60s / mutable 300s），LRU 驱逐、可配容量 |
@@ -64,6 +64,7 @@ v2.0.0 起能力与官方目录**完全对齐**：平台前缀全量一致，官
 
 v3.0.5 修复第五轮审计发现的 8 处运行时缺陷：Docker 直连 3xx（无 401 前置）因重定向请求复用了已被 `cancelBody.Close` 取消的 per-attempt context 而必然 502；匿名 token 重试后重定向跟随失败未检查失败标志导致空指针 panic（应为合成 401）；SSE/AI 流式响应缺少 Flush 导致整体缓冲到响应结束；压缩（gzip/br）缓存条目被 Range 请求按字节切片产生损坏的 206；缓存 416 响应沿用完整资源的陈旧 Content-Length；Range-after-full-cache 的超限回退分支丢失 CORS 头；改写读取上游 body 失败时静默返回截断内容（改为官方语义的纯文本 500）；HEAD 访问 PyPI 索引的 Cache-Control 对齐官方 `no-store`。同时补齐 `cache_hit_full_content` mark、错误响应显式 `Content-Length`，并将超时标志改为 `atomic.Bool`，新增 7 项回归测试。
 v3.0.6 完成第六轮审计与修复，重点在自研磁盘缓存与运行时边角：缓存容量计量改为增量维护、超预算时按磁盘重算，修复覆盖写重复计数与过期条目不扣减导致的过度驱逐；对上游 `Vary`（如 `Vary: Origin`）直接旁路，避免 URL 键跨来源串味；缓存 body 改为版本化文件 + 原子 meta，修复并发读写/覆盖时的条目不一致与命中后 body 消失返回 502 的问题；Range-after-full-cache 的临时落盘加上限（超限改流式回放完整 200），消除磁盘耗尽风险；Docker 重定向、匿名 token 重试与 HEAD 长度探测补回 `TIMEOUT_SECONDS`；错误体按 `Content-Encoding` 解压后再进入 JSON 契约；敏感 PyPI 请求保留 `private, no-store` + `Vary`；请求体缓冲上限从 32MB 降到 1MB；`X-Forwarded-Proto` 仅接受 http/https；并修复空 200 不缓存、`bytes=-0` 未返回 416、字面量平台键被错误切片、非法 UTF-8 百分号序列未拒绝、非协议 304 被错误包装等边界。新增缓存与代理回归测试（含并发 `-race`）。
+v3.0.7 修复第七轮审计发现的编码协商问题：标准请求此前固定向上游请求 `gzip, deflate, br` 并把压缩体原样转发，导致显式声明 `Accept-Encoding: identity` 的客户端仍收到 gzip 字节，且磁盘缓存会把压缩表示命中给不支持该编码的客户端；现在按客户端 `Accept-Encoding` 向上游协商（缺省 `identity`），磁盘缓存只写入 identity 表示，命中时校验编码兼容性，旧压缩条目仅返回给显式支持该编码的客户端。同时为非协议 304 补回安全响应头、让 HEAD 长度探测与 Docker 重定向/匿名 token 重试复用同一个 attempt 截止时间、把不可变制品判定改为解析目标 URL 的 path、对齐 registry token 空字符串语义，并修正 README 的 AI 推理数量（29 家）与 `.gitignore` 的默认缓存目录。
 
 
 | 能力 | 官方版 (Workers) | 本移植版 |
@@ -79,7 +80,7 @@ v3.0.6 完成第六轮审计与修复，重点在自研磁盘缓存与运行时�
 | `X-Performance-Metrics` 性能头 | ✅ | ✅（与官方一致的 mark 时间线） |
 | Git 智能 header 优化 / push | ✅ | ✅（header 透传 + 协议缺省头回填，clone/pull/push/LFS 实测可用） |
 | Docker 私有仓库登录链 (`/v2/auth`) | ✅ | ✅ 完整实现（含匿名 token 自动重试、合成 401 挑战指向本实例） |
-| AI 推理前缀 (`ip-*`) | ✅ | ✅ 28 家全量 |
+| AI 推理前缀 (`ip-*`) | ✅ | ✅ 29 家全量 |
 | 内容改写 (PyPI/npm/Flatpak) | ✅ | ✅ |
 | 缓存 | Cloudflare Cache API（边缘） | ✅ 磁盘缓存层（同源 URL 键、同 TTL 分级、LRU 驱逐、改写内容按请求来源区分缓存键） |
 | 实例鉴权 | ❌ 无（官方建议自部署实例外置鉴权层） | ✅ **与官方一致**：无内置鉴权，`Authorization` 纯透传上游 |
@@ -89,7 +90,7 @@ v3.0.6 完成第六轮审计与修复，重点在自研磁盘缓存与运行时�
 其余运行时层差异（官方源码语义已对齐，差异来自 Go 标准库与 Cloudflare Workers 运行时的能力边界）：
 
 - **URL 点段归一化**：Cloudflare/Node 在请求进入 Worker 之前就把 `/gh/../etc/passwd`、`/gh/%2e%2e/etc/passwd` 归一化为 `/etc/passwd`，官方因此落到 302 首页；Go 收到原始路径，按官方 `validateRequest` 的原始路径检查返回 400 `Invalid path`。直接以原始 URL 调用官方 `validateRequest` 同样返回 400，且官方测试仅要求明文 `..` 不得 500、编码穿越必须 400。
-- **`Accept-Encoding`**：Go 标准库没有 brotli 解码器，因此对可改写平台（PyPI 索引 / npm 元数据 / Flatpak 描述文件）强制 `identity`，保证改写基于明文；其余平台固定向上游请求 `gzip, deflate, br`，压缩体与 `Content-Encoding` 原样转发，客户端需要支持对应编码（`br` 由客户端自带解码器处理）。带 `Range` 的请求强制 `identity`，避免压缩体被按字节切片。
+- **`Accept-Encoding`**：标准请求按客户端 `Accept-Encoding` 向上游协商（缺省 `identity`），压缩体与 `Content-Encoding` 原样转发，客户端只会收到自己声明支持的编码。可改写平台（PyPI 索引 / npm 元数据 / Flatpak 描述文件）与带 `Range` 的请求强制 `identity`：前者保证改写基于明文（Go 标准库没有 brotli 解码器），后者避免压缩体被按字节切片。磁盘缓存只写入 identity 表示，命中时对任意客户端安全；压缩响应不入缓存。
 - **HEAD + 可改写平台**：官方对 HEAD 响应也会执行改写，`response.text()` 为空导致 `Content-Length: 0`；本移植版跳过 HEAD 改写，保留上游长度，避免把真实长度抹成 0。
 
 ## 支持的平台前缀
@@ -159,7 +160,7 @@ v3.0.6 完成第六轮审计与修复，重点在自研磁盘缓存与运行时�
 | `fdroid` | `f-droid.org` | F-Droid 应用 |
 | `jenkins` | `updates.jenkins.io` | Jenkins 插件/更新 |
 
-### AI 推理（28 家，POST/流式透传）
+### AI 推理（29 家，POST/流式透传）
 
 | 前缀 | 上游 | 前缀 | 上游 |
 |------|------|------|------|
@@ -526,7 +527,7 @@ Git/LFS/Docker/AI/Hugging Face 协议请求不受 `ALLOWED_METHODS` 约束（协
 | 旁路 | Git/LFS/Docker/AI/HF 协议、非 GET/HEAD | 不缓存 | `no-store` |
 | 旁路（Vary） | 上游返回 `Vary: *`，或 `Vary` 含 `Origin`/`Cookie`/自定义等客户端可变头 | 不缓存 | `no-store` |
 
-磁盘缓存以 URL 为键，无法像 Cloudflare Cache API 那样按 `Vary` 区分表示；因此对 `Origin` 等客户端可变头敏感的上游响应直接旁路，避免不同来源之间串味。`Vary: Accept-Encoding`/`User-Agent`/`Accept` 等代理侧固定或不转发的头不受影响，仍可缓存。
+磁盘缓存以 URL 为键，无法像 Cloudflare Cache API 那样按 `Vary` 区分表示；因此对 `Origin` 等客户端可变头敏感的上游响应直接旁路，避免不同来源之间串味。缓存只写入 identity 表示，所以 `Vary: Accept-Encoding`/`User-Agent`/`Accept` 等头不会造成跨客户端串味；旧版本遗留的压缩条目仅会返回给显式声明支持该编码的客户端。
 
 `X-Performance-Metrics` 与官方同构，输出按发生顺序记录的 mark 时间线（毫秒）：`attempt_0`/`attempt_1`… 每次上游尝试、`success` 上游 2xx/206、`client_error` 上游 4xx、`docker_auth_challenge` 进入匿名 token 重试、`cache_hit` 缓存命中、`cache_hit_full_content` Range 请求命中全量缓存、`range_cache_hit_after_full_cache` Range 请求在写入全量缓存后切片命中、`complete` 请求结束。例如 `{"attempt_0":12,"success":143,"complete":143}`。带凭证请求永不缓存，缓存命中同样支持 `Range` 断点切片。
 
@@ -651,7 +652,7 @@ hf download bert-base-uncased
 wget "https://xget.example.com/civitai/api/download/models/128713"
 ```
 
-### AI 推理代理（28 家）
+### AI 推理代理（29 家）
 
 前缀即终端，凭证直接使用各家的 API Key（经本实例转发，实例不存储）：
 
@@ -836,7 +837,7 @@ v2.0.0 发布前以下场景均在真实上游实测通过（40 项集成用例�
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | ~~磁盘缓存层~~ | ✅ v2.0.0 | 三级 TTL 分级 + LRU 驱逐，`CACHE_DIR/CACHE_MAX_MB/CACHE_MAX_FILE_MB` 可配 |
-| ~~AI 推理前缀 (`ip-*`)~~ | ✅ v2.0.0 | 28 家全量，POST/流式透传 |
+| ~~AI 推理前缀 (`ip-*`)~~ | ✅ v2.0.0 | 29 家全量，POST/流式透传 |
 | ~~`/v2/auth` 完整登录链~~ | ✅ v2.0.0 | Docker 私有仓库 `docker login` 支持 |
 | ~~平台目录全量~~ | ✅ v2.0.0 | 23 → 84 项，与官方目录一致 |
 | 监听地址选项 | 规划中 | `BIND_ADDR` 环境变量，支持仅绑定内网 IP |

@@ -39,12 +39,43 @@ func requestOrigin(r *http.Request) string {
 // text rewriting (index/metadata pages are far smaller in practice).
 const rewriteMaxBytes = 32 << 20
 
+// isIdentityEncoding reports whether a Content-Encoding value denotes an
+// unencoded (identity) representation.
+func isIdentityEncoding(enc string) bool {
+	enc = strings.ToLower(strings.TrimSpace(enc))
+	return enc == "" || enc == "identity"
+}
+
 // cacheEntrySliceable reports whether a cached body can be sliced with a
 // byte Range. Compressed representations (gzip/br/deflate) are stored as the
 // encoded bytes, so slicing them yields a corrupt partial stream.
 func cacheEntrySliceable(entry *cache.Entry) bool {
-	enc := strings.TrimSpace(entry.Header.Get("Content-Encoding"))
-	return enc == "" || strings.EqualFold(enc, "identity")
+	return isIdentityEncoding(entry.Header.Get("Content-Encoding"))
+}
+
+// cacheEntryEncodingAcceptable reports whether the client can decode the
+// cached representation. New entries are identity-only; legacy entries may
+// still be compressed and are served only to clients that explicitly accept
+// that coding (a client without Accept-Encoding falls back to a fresh
+// identity fetch).
+func cacheEntryEncodingAcceptable(entry *cache.Entry, r *http.Request) bool {
+	enc := strings.ToLower(strings.TrimSpace(entry.Header.Get("Content-Encoding")))
+	if isIdentityEncoding(enc) {
+		return true
+	}
+	return acceptsEncoding(r.Header.Get("Accept-Encoding"), enc)
+}
+
+// acceptsEncoding reports whether the Accept-Encoding header explicitly
+// accepts the given coding (or "*").
+func acceptsEncoding(header, coding string) bool {
+	for _, part := range strings.Split(header, ",") {
+		token := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if token == "*" || strings.EqualFold(token, coding) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseSingleRange parses a single "bytes=a-b" / "bytes=a-" / "bytes=-n"

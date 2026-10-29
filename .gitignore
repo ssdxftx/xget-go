@@ -2,3 +2,5 @@ xget-linux-amd64
 xget-linux-arm64
 xget-darwin-arm64
 *.log
+# Default disk cache directory when the binary runs from the repo root.
+cache/

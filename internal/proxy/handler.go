@@ -345,7 +345,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// tryReadCachedResponse: protocol requests, sensitive headers and
 	// non-GET/HEAD never touch the cache).
 	if policy.Cacheable && r.Method == http.MethodGet {
-		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil && !responseVaryBypassesCache(entry.Header) {
+		if entry := h.store.Get(cache.Key(cacheURL)); entry != nil &&
+			!responseVaryBypassesCache(entry.Header) &&
+			cacheEntryEncodingAcceptable(entry, r) {
 			// Byte-range slicing is only valid for identity-encoded bodies.
 			// A compressed entry (gzip/br/deflate) must not be sliced; skip
 			// the hit and refetch, because Range requests are sent upstream
@@ -475,7 +477,7 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 				target += "?" + q
 			}
 			hdr.Del("Content-Length")
-			if cl := h.probeHEADContentLength(r.Context(), target, buildHeaders(r, v, passthrough, target, traits, key2)); cl != "" {
+			if cl := h.probeHEADContentLength(r.Context(), target, buildHeaders(r, v, passthrough, target, traits, key2), up.deadline); cl != "" {
 				hdr.Set("Content-Length", cl)
 			}
 		}
@@ -541,11 +543,21 @@ func (h *Handler) finalize(w http.ResponseWriter, r *http.Request, up *upstreamR
 				hdr.Set("Vary", "Authorization, Cookie")
 			}
 		}
-		if resp.StatusCode == http.StatusOK && r.Method == http.MethodGet && respPolicy.Cacheable {
+		if resp.StatusCode == http.StatusOK && r.Method == http.MethodGet && respPolicy.Cacheable &&
+			isIdentityEncoding(hdr.Get("Content-Encoding")) {
+			// The disk cache is keyed by URL only, so it stores identity
+			// representations exclusively; a gzip/br body is streamed but
+			// never shared with clients that did not accept that encoding.
 			cacheWriter = h.store.Begin(cache.Key(cacheURL), resp.StatusCode, hdr, respPolicy.EdgeTTL)
 		}
 		hdr.Set("X-Content-Type-Options", "nosniff")
 		hdr.Set("Accept-Ranges", "bytes")
+		security.AddSecurityHeaders(hdr)
+	}
+
+	// 304 has no body and skips the 2xx cache-policy block; upstream still
+	// applies the security header set to non-protocol responses.
+	if !traits.IsProtocol() && resp.StatusCode == http.StatusNotModified {
 		security.AddSecurityHeaders(hdr)
 	}
 

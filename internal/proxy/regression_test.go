@@ -85,9 +85,10 @@ func gzipString(s string) []byte {
 	return b.Bytes()
 }
 
-// A full response cached in gzip form must not be byte-sliced for a later
-// Range request: the cached bytes are the compressed stream.
-func TestRangeOnCompressedCachedEntryNotSliced(t *testing.T) {
+// A compressed upstream response is forwarded to a client that accepts it but
+// never stored (the disk cache keeps identity representations only), so a
+// later Range request refetches an identity body and slices it safely.
+func TestCompressedResponseNotCachedRangeSlicesIdentity(t *testing.T) {
 	payload := strings.Repeat("0123456789", 100)
 	compressed := gzipString(payload)
 	h := testHandler(t, func() *http.ServeMux {
@@ -109,8 +110,12 @@ func TestRangeOnCompressedCachedEntryNotSliced(t *testing.T) {
 		return m
 	}())
 
-	if rec := doGet(h, "/gist/file.txt", nil); rec.Code != http.StatusOK {
-		t.Fatalf("prime status = %d", rec.Code)
+	prime := doGet(h, "/gist/file.txt", map[string]string{"Accept-Encoding": "gzip"})
+	if prime.Code != http.StatusOK {
+		t.Fatalf("prime status = %d", prime.Code)
+	}
+	if enc := prime.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("prime encoding = %q, want gzip", enc)
 	}
 
 	req := httptest.NewRequest("GET", "/gist/file.txt", nil)
@@ -127,8 +132,8 @@ func TestRangeOnCompressedCachedEntryNotSliced(t *testing.T) {
 		}
 	}
 
-	// The Range fetch above replaced the compressed entry with the identity
-	// full body, so the next Range is served straight from cache.
+	// The Range fetch above stored the identity full body, so the next Range
+	// is served straight from cache.
 	req2 := httptest.NewRequest("GET", "/gist/file.txt", nil)
 	req2.Header.Set("Range", "bytes=0-9")
 	rec2 := httptest.NewRecorder()

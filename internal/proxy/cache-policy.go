@@ -121,12 +121,31 @@ func isVersionedPyPIFilePath(pathname string) bool {
 	return hasVersionLikeToken(stem)
 }
 
+// targetPathname extracts the pathname from a target URL or request path,
+// mirroring getPathname in the original (new URL(value).pathname with a
+// bare-path fallback). EscapedPath keeps percent-encoding intact.
+func targetPathname(targetURL string) string {
+	if targetURL == "" {
+		return ""
+	}
+	if u, err := url.Parse(targetURL); err == nil {
+		if p := u.EscapedPath(); p != "" {
+			return p
+		}
+		if u.Path != "" {
+			return u.Path
+		}
+	}
+	p := targetURL
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	return p
+}
+
 // isImmutableArtifactRequest mirrors isImmutableArtifactRequest.
 func isImmutableArtifactRequest(plat, effectivePath, targetURL string) bool {
-	targetPath := targetURL
-	if i := strings.IndexAny(targetPath, "?#"); i >= 0 {
-		targetPath = targetPath[:i]
-	}
+	targetPath := targetPathname(targetURL)
 	switch plat {
 	case "npm":
 		return reNpmTarball.MatchString(effectivePath) || reNpmTarball.MatchString(targetPath)
@@ -241,10 +260,10 @@ func hasCacheControlDirective(cacheControl, directive string) bool {
 }
 
 // safeVaryHeaders lists request headers that either the proxy does not forward
-// (Accept, Accept-Language), always fixes (User-Agent) or handles separately
-// (Range). A response that varies on anything else (notably Origin, which the
-// standard profile forwards) must not be shared between clients by the
-// URL-only disk cache.
+// (Accept, Accept-Language), always fixes (User-Agent), handles separately
+// (Range) or caches only in an identity form (Accept-Encoding). A response
+// that varies on anything else (notably Origin, which the standard profile
+// forwards) must not be shared between clients by the URL-only disk cache.
 var safeVaryHeaders = map[string]bool{
 	"accept":          true,
 	"accept-encoding": true,
